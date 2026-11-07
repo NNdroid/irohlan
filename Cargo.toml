@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "P2P Layer-2 (TAP) VPN for Linux built on iroh"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-only"
 repository = "https://github.com/example/irohlan"
 readme = "README.md"
 

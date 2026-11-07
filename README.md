@@ -159,4 +159,4 @@ CI(GitHub Actions,ubuntu)运行 check + clippy + test,见
 
 ## License
 
-MIT OR Apache-2.0
+GPL-3.0(与仓库 LICENSE 一致;依赖均为 MIT/Apache-2.0,兼容)
