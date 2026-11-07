@@ -1,0 +1,36 @@
+[package]
+name = "irohlan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "P2P Layer-2 (TAP) VPN for Linux built on iroh"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/irohlan"
+readme = "README.md"
+
+[dependencies]
+iroh = "1.4"
+iroh-gossip = "0.102"
+iroh-mdns-address-lookup = "0.5"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+base32 = "0.5"
+dirs = "6"
+serde_json = "1"
+futures = "0.3"
+thiserror = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tun-rs = { version = "2", features = ["async"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

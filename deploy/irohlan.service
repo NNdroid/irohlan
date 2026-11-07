@@ -1,0 +1,42 @@
+# irohlan systemd unit — run a node from its saved state as a system service.
+#
+# Setup:
+#   1. Install the binary:       sudo cp target/x86_64-unknown-linux-gnu/release/irohlan /usr/local/bin/
+#   2. Allow TAP without root:   sudo setcap cap_net_admin+ep /usr/local/bin/irohlan
+#   3. Create/join once interactively (as your user):
+#        irohlan create            # or: irohlan join <ticket> --secret ...
+#   4. Enable the service:
+#        sudo systemctl enable --now irohlan@$USER
+#
+# The template instance runs `irohlan run` as the given user and reuses the
+# state under ~/.local/state/irohlan/ (XDG_STATE_HOME).
+
+[Unit]
+Description=irohlan P2P layer-2 VPN node
+Documentation=https://github.com/example/irohlan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/local/bin/irohlan run
+Restart=on-failure
+RestartSec=5
+
+# TAP device management
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/irohlan
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
