@@ -96,6 +96,9 @@ jobs:
         run: ./target/release/irohlan --help
 
       - name: Run benchmark
+        # Every iperf3 call is individually bounded; this is a backstop so a
+        # regression cannot pin a runner until the 45-minute job timeout.
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           extra=()

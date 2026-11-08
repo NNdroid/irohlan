@@ -293,9 +293,24 @@ mDNS 保持开启但不在关键路径上,它和 pkarr/DNS 超时只是预期日
 > 由 `frames_to_tap` 停滞 + `member expired` + `gossip dial failed` 定位到总线;
 > 换成 flood 后第三次发现「创建者能发不能收」,才下沉到 mesh 传输层。
 
+第四次 CI 复验里 mesh 已修好(direct/clean 全程测完:TCP ≈ 1.11 Gbit/s、
+ping 0% 丢包 0.364 ms;relay/clean TCP ≈ 8.4 Mbit/s,符合 2048 KiB/s 上限),
+但 relay 档 TCP 测完后**整个 job 挂住 20 多分钟**:客户端 `tcp.json` 已完整写出,
+服务端 `tcp-server.json` 却是 0 字节 —— 限速中继把 iperf3 最后一次控制通道
+交互拖死,`--one-off` 服务端没有自己的超时,卡在 `recv()`;而 `bench_stop_iperf_server()`
+里的裸 `wait "$pid"` 又等的是 `ip netns exec` 的父进程(iperf3 是孙进程),于是
+永不返回。现在每个 iperf3 服务端都套 `timeout -k 5 BENCH_IPERF_SERVER_SECS`
+(默认 90 秒),停止时先按 `/proc/<pid>/cmdline` 扫净 namespace 里的 iperf3,
+再用有界 `bench_wait_bounded` 取代 `wait`(同时识别僵尸态并回收);所有客户端
+统一用 `timeout -k 5`,elephant 流的等待也有上限,benchmark 步骤另有 30 分钟
+硬超时兜底。
+
 harness 还要求 overlay **连续 3 次 ping 成功**才算就绪(单次成功可能是刚建链时
 的偶然回包),并在每个弱网档位开始前先清掉上一档的 qdisc、再探一次活;overlay
 中途挂掉会立刻判该 mode 失败并落诊断,而不是把一堆空测量结果记成「弱网表现」。
+环境变量可覆盖 `BENCH_ROOT`、`BENCH_MTU`、`BENCH_READY_TIMEOUT`、
+`BENCH_READY_STREAK`、`BENCH_PROBE_TIMEOUT`、`BENCH_PING_COUNT`、
+`BENCH_IPERF_SERVER_SECS`。
 
 前置条件:root、`/dev/net/tun`、`iproute2`(`ip` + `tc`)、`iperf3`、
 `iputils-ping`、`python3`、`coreutils`。

@@ -44,6 +44,11 @@ BENCH_PING_COUNT="${BENCH_PING_COUNT:-20}"
 # status.json is written every 5s; wait for one more tick before collecting
 # so the "after" snapshot includes the whole measurement window.
 BENCH_SETTLE_SECS="${BENCH_SETTLE_SECS:-6}"
+# Hard lifetime for every iperf3 server. An overloaded relay can drop the
+# final control-channel exchange, leaving `--one-off` blocked in recv() with
+# no server-side timeout at all. Without this ceiling the harness would hang
+# in `wait` until the CI job timeout.
+BENCH_IPERF_SERVER_SECS="${BENCH_IPERF_SERVER_SECS:-90}"
 
 BENCH_NODES=()
 BENCH_VETH_DEVS=()
@@ -448,21 +453,82 @@ bench_check_overlay() {
 # ---------------------------------------------------------------------------
 # Measurements
 # ---------------------------------------------------------------------------
+# Kill every iperf3 left inside a namespace. `ip netns exec` forks, so a PID
+# recorded with $! may belong to the `ip` parent while iperf3 is a grandchild
+# that keeps port 5201 occupied after the parent is gone. The cmdline match
+# also catches the `timeout ... iperf3` wrapper.
+bench_kill_iperf_in_ns() {
+    local ns=$1 p cmd="" comm=""
+    for p in $(ip netns pids "$ns" 2>/dev/null || true); do
+        cmd=""
+        comm=""
+        # Guard the redirect itself: a missing /proc entry would otherwise
+        # print a shell error (2>/dev/null on `tr` does not cover it).
+        if [[ -r "/proc/$p/cmdline" ]]; then
+            cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null || true)
+        elif [[ -r "/proc/$p/comm" ]]; then
+            read -r comm <"/proc/$p/comm" || comm=""
+        fi
+        if [[ "$cmd" == *iperf3* || "$comm" == *iperf3* ]]; then
+            kill -9 "$p" 2>/dev/null || true
+        fi
+    done
+}
+
+# Wait for a background PID but never forever. iperf3 servers can hang when
+# the relay queue drops their control stream, and a bare `wait` then stalls
+# the whole benchmark until the job timeout. A zombie still answers `kill -0`,
+# so /proc state is checked too and the child is always reaped.
+bench_wait_bounded() {
+    local pid=$1 secs=${2:-5} i state=""
+    for ((i = 0; i < secs * 5; i++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        state=""
+        if [[ -r "/proc/$pid/stat" ]]; then
+            read -r _ _ state _ <"/proc/$pid/stat" || true
+        fi
+        if [[ "$state" == Z* ]]; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.2
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+}
+
 bench_run_iperf_server() {
-    local pidfile=$1 ip
+    local pidfile=$1 ip ns
+    ns=$(ns_of "$(bench_server_node)")
     ip=$(vip_of "$(bench_server_node)")
-    ip netns exec "$(ns_of "$(bench_server_node)")" iperf3 -s -B "$ip" -J --one-off \
+    # A previous test may have left a server behind; make sure the port is
+    # free before binding it again.
+    bench_kill_iperf_in_ns "$ns"
+    # `timeout` is the last line of defence: `--one-off` has no server-side
+    # deadline, and a stalled control connection must not outlive the test.
+    ip netns exec "$ns" timeout -k 5 "$BENCH_IPERF_SERVER_SECS" \
+        iperf3 -s -B "$ip" -J --one-off \
         >"$pidfile.json" 2>"$pidfile.err" &
     echo "$!" >"$pidfile.pid"
     sleep 1
 }
 
 bench_stop_iperf_server() {
-    local pidfile=$1 pid
+    local pidfile=$1 pid ns
     [[ -f "$pidfile.pid" ]] || return 0
     pid=$(cat "$pidfile.pid")
+    ns=$(ns_of "$(bench_server_node)")
+    # Kill the real iperf3 FIRST. If we only signal the recorded `ip` wrapper,
+    # its child can stay alive and keep the wrapper (and `wait`) blocked.
+    bench_kill_iperf_in_ns "$ns"
     kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    bench_wait_bounded "$pid" 5 || true
+    # Second pass for grandchildren that were forked after the first scan.
+    bench_kill_iperf_in_ns "$ns"
     rm -f "$pidfile.pid"
 }
 
@@ -478,7 +544,7 @@ bench_measure() {
 
     # TCP goodput + retransmits.
     bench_run_iperf_server "$out/tcp-server"
-    if ! ip netns exec "$ns_a" timeout "$((duration + 30))" iperf3 \
+    if ! ip netns exec "$ns_a" timeout -k 5 "$((duration + 30))" iperf3 \
         -c "$ip_s" -B "$ip_a" -t "$duration" -P "$parallel" -J \
         >"$out/tcp.json" 2>"$out/tcp.err"; then
         echo "tcp iperf3 failed" >>"$out/errors.txt"
@@ -487,7 +553,7 @@ bench_measure() {
 
     # UDP goodput, loss and jitter.
     bench_run_iperf_server "$out/udp-server"
-    if ! ip netns exec "$ns_a" timeout "$((duration + 30))" iperf3 \
+    if ! ip netns exec "$ns_a" timeout -k 5 "$((duration + 30))" iperf3 \
         -c "$ip_s" -B "$ip_a" -u -b "$udp_rate" -t "$duration" -J \
         >"$out/udp.json" 2>"$out/udp.err"; then
         echo "udp iperf3 failed" >>"$out/errors.txt"
@@ -513,7 +579,7 @@ bench_measure() {
     # only meaningful when a relay node is actually rate-limiting forwarding.
     if [[ "$BENCH_MODE" == relay && "$relay_limit" -gt 0 ]]; then
         bench_run_iperf_server "$out/elephant-server"
-        ip netns exec "$ns_a" timeout "$((duration + 20))" iperf3 \
+        ip netns exec "$ns_a" timeout -k 5 "$((duration + 20))" iperf3 \
             -c "$ip_s" -B "$ip_a" -t "$duration" -P 4 -J \
             >"$out/elephant.json" 2>"$out/elephant.err" &
         local elephant=$!
@@ -522,7 +588,7 @@ bench_measure() {
             >"$out/ping-under-load.txt" 2>&1; then
             echo "ping-under-load failed" >>"$out/errors.txt"
         fi
-        wait "$elephant" 2>/dev/null || true
+        bench_wait_bounded "$elephant" "$((duration + 30))" || true
         bench_stop_iperf_server "$out/elephant-server"
     fi
 }

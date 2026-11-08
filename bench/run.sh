@@ -46,7 +46,8 @@ Profiles are applied with `tc netem` on every veth hop, i.e. on the QUIC
 underlay, not on the emulated TAP frames. The harness always uses the flood
 broadcast bus: gossip needs address lookup that an isolated netns cannot
 provide. Environment overrides: BENCH_ROOT, BENCH_MTU, BENCH_READY_TIMEOUT,
-BENCH_READY_STREAK, BENCH_PROBE_TIMEOUT, BENCH_PING_COUNT.
+BENCH_READY_STREAK, BENCH_PROBE_TIMEOUT, BENCH_PING_COUNT,
+BENCH_IPERF_SERVER_SECS.
 EOF
 }
 
@@ -74,6 +75,10 @@ done
 [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -gt 0 ]] || bench_die "--parallel must be a positive integer"
 [[ "$RELAY_LIMIT" =~ ^[0-9]+$ ]] || bench_die "--relay-limit-kib must be a non-negative integer"
 [[ "$BENCH_SETTLE_SECS" =~ ^[0-9]+$ ]] || bench_die "--settle must be a non-negative integer"
+
+# The server must outlive the client's own deadline (duration + 30s) but must
+# not keep port 5201 busy for minutes if its control connection gets stuck.
+export BENCH_IPERF_SERVER_SECS="${BENCH_IPERF_SERVER_SECS:-$((DURATION + 45))}"
 
 if [[ -n "$OUTPUT" ]]; then
     export BENCH_OUT=$OUTPUT
