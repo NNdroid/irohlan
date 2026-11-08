@@ -467,7 +467,7 @@ async fn close_watcher(shared: Arc<Shared>, handle: Arc<PeerHandle>, remote: End
 }
 
 async fn outbound_pump(handle: Arc<PeerHandle>, mut out_rx: mpsc::Receiver<OutMsg>) {
-    let max_dgram = handle.conn.max_datagram_size().unwrap_or(0);
+    let remote = handle.conn.remote_id();
     loop {
         let msg = tokio::select! {
             msg = out_rx.recv() => match msg {
@@ -476,6 +476,11 @@ async fn outbound_pump(handle: Arc<PeerHandle>, mut out_rx: mpsc::Receiver<OutMs
             },
             _ = handle.conn.closed() => break,
         };
+        // `max_datagram_size()` varies over the life of a connection with the
+        // path-MTU estimate and can be `None` before the handshake settles.
+        // Reading it once when the pump starts permanently pins the connection
+        // to a stale value (often 0, i.e. uni-streams for every message).
+        let max_dgram = handle.conn.max_datagram_size().unwrap_or(0);
         let result = match msg {
             OutMsg::Frame { hop, frame } => {
                 // Wire shape: [tag][hop][frame…]
@@ -490,30 +495,42 @@ async fn outbound_pump(handle: Arc<PeerHandle>, mut out_rx: mpsc::Receiver<OutMs
             }
         };
         if let Err(err) = result {
-            tracing::debug!("send failed: {err:#}");
-            break;
+            // A single oversized datagram or a broken stream must NOT retire
+            // the pump: the handle stays in `peers`, so every later frame
+            // would be silently swallowed by a dead channel. Log and keep
+            // draining; the small backoff avoids a hot error loop.
+            tracing::warn!(peer = %remote.fmt_short(), "mesh send failed, continuing: {err:#}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
 
 /// Send a tagged payload: datagram when it fits, uni-stream otherwise.
+///
+/// A datagram failure (for example a path-MTU shrink between the size check
+/// and the send) falls back to a uni-stream instead of failing the message.
 async fn send_payload(
     handle: &PeerHandle,
     tag_byte: u8,
     payload: Bytes,
     max_dgram: usize,
 ) -> anyhow::Result<()> {
-    if max_dgram > 0 && payload.len() < max_dgram {
-        let mut datagram = BytesMut::with_capacity(payload.len() + 1);
-        datagram.extend_from_slice(&[tag_byte]);
-        datagram.extend_from_slice(&payload);
-        handle.conn.send_datagram_wait(datagram.freeze()).await?;
-        return Ok(());
+    let mut datagram = BytesMut::with_capacity(payload.len() + 1);
+    datagram.extend_from_slice(&[tag_byte]);
+    datagram.extend_from_slice(&payload);
+    let datagram = datagram.freeze();
+
+    if max_dgram > 0 && datagram.len() <= max_dgram {
+        match handle.conn.send_datagram_wait(datagram.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::debug!("datagram send failed, falling back to uni stream: {err}");
+            }
+        }
     }
     // Overflow path: one uni-directional stream per payload.
     let mut send = handle.conn.open_uni().await?;
-    send.write_all(&[tag_byte]).await?;
-    send.write_all(&payload).await?;
+    send.write_all(&datagram).await?;
     send.finish().ok();
     Ok(())
 }
@@ -530,13 +547,22 @@ async fn inbound_pump(shared: Arc<Shared>, handle: Arc<PeerHandle>) {
             }
             uni = conn.accept_uni() => {
                 match uni {
-                    Ok(mut recv) => match recv.read_to_end(MAX_STREAM_MSG_LEN).await {
-                        Ok(data) => ingest_tagged(&shared, &conn.remote_id(), &data),
-                        Err(err) => {
-                            tracing::debug!("uni stream read failed: {err}");
-                            continue;
-                        }
-                    },
+                    Ok(recv) => {
+                        // Do not await the stream body inside the select loop:
+                        // a slow/large stream used to starve read_datagram()
+                        // and accept_uni() for the whole connection, which
+                        // looked like a one-way link failure. Each stream is
+                        // drained independently.
+                        let shared = shared.clone();
+                        let from = conn.remote_id();
+                        tokio::spawn(async move {
+                            let mut recv = recv;
+                            match recv.read_to_end(MAX_STREAM_MSG_LEN).await {
+                                Ok(data) => ingest_tagged(&shared, &from, &data),
+                                Err(err) => tracing::debug!("uni stream read failed: {err}"),
+                            }
+                        });
+                    }
                     Err(_) => break,
                 }
             }
@@ -555,15 +581,19 @@ fn ingest_tagged(shared: &Shared, from: &EndpointId, data: &[u8]) {
             let Some((&hop, frame)) = rest.split_first() else {
                 return;
             };
-            let _ = shared.frame_tx.try_send(InboundFrame {
+            if let Err(err) = shared.frame_tx.try_send(InboundFrame {
                 from: *from,
                 hop,
                 frame: Bytes::copy_from_slice(frame),
-            });
+            }) {
+                tracing::warn!(peer = %from.fmt_short(), "inbound frame channel rejected: {err}");
+            }
         }
         tag::FLOOD => match postcard::from_bytes::<FloodEnvelope>(rest) {
             Ok(envelope) => {
-                let _ = shared.flood_tx.try_send((*from, envelope));
+                if let Err(err) = shared.flood_tx.try_send((*from, envelope)) {
+                    tracing::warn!(peer = %from.fmt_short(), "inbound flood channel rejected: {err}");
+                }
             }
             Err(err) => tracing::debug!("bad flood message: {err}"),
         },

@@ -269,6 +269,8 @@ bench_start_nodes() {
     #
     # mDNS is left enabled but is NOT on the critical path: its send errors
     # and the pkarr/DNS timeouts are expected noise in this topology.
+    # Our own crate logs at debug level so mesh send failures, dropped frames
+    # and bus delivery problems land in the collected node logs.
     local common=(--no-relay --bus flood --mtu "$BENCH_MTU"
         --secret "$BENCH_SECRET"
         --relay-limit-kib "$relay_limit"
@@ -288,7 +290,7 @@ bench_start_nodes() {
     fi
 
     ip netns exec "$(ns_of "$creator")" \
-        env XDG_STATE_HOME="$BENCH_STATE_ROOT/$creator" RUST_LOG=info \
+        env XDG_STATE_HOME="$BENCH_STATE_ROOT/$creator" RUST_LOG="info,irohlan=debug" \
         "$BENCH_BINARY" create --dev "tap-$creator" "${creator_args[@]}" \
         >"$BENCH_LOG_ROOT/$creator.log" 2>&1 &
     BENCH_PIDS+=("$!")
@@ -315,7 +317,7 @@ bench_start_nodes() {
         # Pin the virtual IPv4 so the harness knows every address up front.
         # The creator derives the matching IPv6 from the same host index.
         ip netns exec "$(ns_of "$node")" \
-            env XDG_STATE_HOME="$BENCH_STATE_ROOT/$node" RUST_LOG=info \
+            env XDG_STATE_HOME="$BENCH_STATE_ROOT/$node" RUST_LOG="info,irohlan=debug" \
             "$BENCH_BINARY" join "$BENCH_TICKET" --ip "$(vip_of "$node")" \
             --dev "tap-$node" "${common[@]}" \
             >"$BENCH_LOG_ROOT/$node.log" 2>&1 &

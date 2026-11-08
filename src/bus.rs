@@ -99,6 +99,17 @@ pub struct BroadcastBus {
     seen: Mutex<DedupRing>,
 }
 
+/// Deliver a bus event, surfacing the "nobody is listening" case instead of
+/// silently dropping it. A zero-receiver broadcast is easy to hit during
+/// startup because the publishers are spawned before the switch subscribes.
+fn emit(tx: &broadcast::Sender<BusEvent>, event: BusEvent) {
+    if tx.receiver_count() == 0 {
+        tracing::warn!("bus event dropped: no subscribers yet");
+        return;
+    }
+    let _ = tx.send(event);
+}
+
 impl BroadcastBus {
     /// Start the bus and spawn its receive pumps.
     ///
@@ -127,13 +138,13 @@ impl BroadcastBus {
                             Ok(Event::Received(msg)) => {
                                 match postcard::from_bytes::<BusMsg>(&msg.content) {
                                     Ok(BusMsg::Frame(frame)) => {
-                                        let _ = events.send(BusEvent::Frame(Bytes::from(frame)));
+                                        emit(&events, BusEvent::Frame(Bytes::from(frame)));
                                     }
                                     Ok(BusMsg::Announce(record)) => {
-                                        let _ = events.send(BusEvent::Announce(record));
+                                        emit(&events, BusEvent::Announce(record));
                                     }
                                     Ok(BusMsg::LinkState(ls)) => {
-                                        let _ = events.send(BusEvent::LinkState(ls));
+                                        emit(&events, BusEvent::LinkState(ls));
                                     }
                                     Err(err) => {
                                         tracing::debug!("bad bus message: {err}");
@@ -141,10 +152,10 @@ impl BroadcastBus {
                                 }
                             }
                             Ok(Event::NeighborUp(id)) => {
-                                let _ = events.send(BusEvent::NeighborUp(id));
+                                emit(&events, BusEvent::NeighborUp(id));
                             }
                             Ok(Event::NeighborDown(id)) => {
-                                let _ = events.send(BusEvent::NeighborDown(id));
+                                emit(&events, BusEvent::NeighborDown(id));
                             }
                             Ok(Event::Lagged) => {
                                 tracing::warn!("gossip subscription lagged, events dropped");
@@ -232,13 +243,13 @@ impl BroadcastBus {
         self.mesh.flood_send(&envelope, Some(from));
         match envelope.msg {
             BusMsg::Frame(frame) => {
-                let _ = self.event_tx.send(BusEvent::Frame(Bytes::from(frame)));
+                emit(&self.event_tx, BusEvent::Frame(Bytes::from(frame)));
             }
             BusMsg::Announce(record) => {
-                let _ = self.event_tx.send(BusEvent::Announce(record));
+                emit(&self.event_tx, BusEvent::Announce(record));
             }
             BusMsg::LinkState(ls) => {
-                let _ = self.event_tx.send(BusEvent::LinkState(ls));
+                emit(&self.event_tx, BusEvent::LinkState(ls));
             }
         }
     }

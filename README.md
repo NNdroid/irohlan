@@ -271,18 +271,27 @@ veth endpoint 的 egress qdisc 上,劣化的是 QUIC underlay 而不是 TAP 帧�
 netns 里没有 DNS、没有默认路由,mDNS 也因为「找不到默认接口」无法加入多播组
 (`could not join multicast group ... No such device`),所以 `gossip dial failed:
 timed out` 会反复出现。后果不是 QUIC 断链 —— `connected_peers`、`link_metrics`
-和 `routes` 都正常 —— 而是 **ARP/NDP 广播帧与 20 秒一次的成员公告送不出去**;
+和 `routes` 都正常 —— 而是 ARP/NDP 广播帧与 20 秒一次的成员公告送不出去;
 成员 TTL(60 秒)一到就被清掉,`by_mac()` 找不到对端,`ping` 变成
-`Destination Host Unreachable`、`iperf3` 变成 `No route to host`。
+`Destination Host Unreachable`、`iperf3` 变成 `No route to host`。flood 把广播
+封装成 `(origin, seq)` 信封沿**已建立的 mesh 连接**泛洪,不需要地址发现;relay
+拓扑另外用 `--mesh-links 1`,让 partial-mesh dialer 不再尝试拨没有地址的 c。
+mDNS 保持开启但不在关键路径上,它和 pkarr/DNS 超时只是预期日志噪声。
 
-flood 把广播封装成 `(origin, seq)` 信封,直接沿**已经建立的 mesh 连接**泛洪,
-完全不需要地址发现;relay 拓扑另外用 `--mesh-links 1`,让 partial-mesh dialer
-不再尝试拨一个没有地址的 c。mDNS 保持开启但不在关键路径上,它和 pkarr/DNS
-的超时只是这个隔离环境里的预期日志噪声。
+第三次 CI 复验又暴露出更底层的 **mesh 单向传输问题**:flood 已经能把创建者的
+帧送到加入者(加入者 `frames_to_tap` 持续增长),但反方向只通最初几个包就停,
+创建者 `members: []` / `lsdb_entries: 0`,成员 75 秒后过期。据此加固了
+[`src/mesh.rs`](src/mesh.rs):`max_datagram_size()` 改为每条消息重算(该值随
+路径 MTU 变化,只在 pump 启动时取一次会把连接永久钉死在 0)、datagram 发送
+失败自动回落 uni-stream、**单次发送失败不再让 outbound pump 退出**(原本
+`break` 后 handle 仍在 `peers` 里,后续帧全被静默吞掉)、uni-stream 读取拆到
+独立任务避免饿死 `read_datagram()`。同时把总线订阅提前到发布者启动之前,
+并为「零订阅者」「入站通道拒绝」「发送失败」加上可见日志,harness 运行时
+`RUST_LOG=info,irohlan=debug` 会把它们收进节点日志。
 
-> 排障顺序(CI 两次报红总结):第一次以为是 `--no-mdns` 的锅,打开 mDNS 后
-> 第二次复验依然失败;对比 `status.json` 里的 `frames_to_tap` 停滞、日志里的
-> `member expired` 与 `gossip dial failed` 才定位到总线,而不是地址发现。
+> 排障顺序(CI 三次报红):第一次误判 `--no-mdns`;打开 mDNS 后第二次仍失败,
+> 由 `frames_to_tap` 停滞 + `member expired` + `gossip dial failed` 定位到总线;
+> 换成 flood 后第三次发现「创建者能发不能收」,才下沉到 mesh 传输层。
 
 harness 还要求 overlay **连续 3 次 ping 成功**才算就绪(单次成功可能是刚建链时
 的偶然回包),并在每个弱网档位开始前先清掉上一档的 qdisc、再探一次活;overlay

@@ -343,6 +343,12 @@ pub async fn run_node(
         gossip,
     )
     .await?;
+    // Subscribe synchronously, before any publisher task can run. Creating
+    // the receivers inside a spawned task risks a startup race where the
+    // first flood/LSA events see zero receivers and are dropped by the
+    // broadcast channel.
+    let switch_bus_events = bus.subscribe();
+    let node_bus_events = bus.subscribe();
 
     // --- routing -------------------------------------------------------------
     let routing = Arc::new(RwLock::new(RoutingTable::new(IdBytes::from(my_id))));
@@ -500,7 +506,6 @@ pub async fn run_node(
         counters.clone(),
         relay.clone(),
     );
-    let switch_bus_events = bus.subscribe();
     tokio::spawn(switch.run(from_tap_rx, frame_rx, switch_bus_events));
 
     // Relay queue pump: the switch only enqueues; DRR-selected frames are
@@ -575,7 +580,7 @@ pub async fn run_node(
         let gossip_joined = gossip_joined.clone();
         let routing = routing.clone();
         let my_id_bytes = *my_id.as_bytes();
-        let mut events = bus.subscribe();
+        let mut events = node_bus_events;
         async move {
             loop {
                 match events.recv().await {
