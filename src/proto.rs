@@ -1,13 +1,19 @@
 //! Wire protocol definitions: ethernet frame classification, control
 //! messages and the framing used on mesh connections.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use serde::{Deserialize, Serialize};
+
+use crate::netaddr::VirtualAddrs;
 
 /// ALPN of the irohlan mesh protocol.
 ///
-/// v2 added multi-hop unicast relaying (partial mesh): the FRAME payload
-/// carries a hop counter and the bus carries link-state advertisements.
-pub const ALPN: &[u8] = b"irohlan/v2";
+/// v4 made link-state advertisements carry a per-link RTT; v5 extends each
+/// link with measured loss and throughput/bandwidth so routes are chosen by
+/// overall link quality instead of pure latency. v5 peers cannot talk to
+/// v4/v3/v2 peers; join tickets (v2) are unchanged and still decodable.
+pub const ALPN: &[u8] = b"irohlan/v5";
 
 /// Hard upper bound for anything we read from a stream (frames or messages).
 pub const MAX_STREAM_MSG_LEN: usize = 65_535;
@@ -81,6 +87,22 @@ impl IdBytes {
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
+
+    /// Parse a full 64-character hex string. Returns `None` on malformed
+    /// input, so a damaged ledger file can be skipped rather than aborting
+    /// node startup.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            out[i] = (hi * 16 + lo) as u8;
+        }
+        Some(IdBytes(out))
+    }
 }
 
 impl std::fmt::Debug for IdBytes {
@@ -113,15 +135,35 @@ impl std::fmt::Display for IdBytes {
 pub struct MemberRecord {
     /// Endpoint id; the virtual MAC is derived from it.
     pub id: IdBytes,
-    /// Virtual IPv4 address.
-    pub ip: u32,
+    /// Virtual IPv4 and/or IPv6 addresses.
+    /// `default` only matters for JSON: it lets an old status.json (which
+    /// stored a bare IPv4 `ip`) deserialize without errors.
+    #[serde(default)]
+    pub addrs: VirtualAddrs,
     /// Human readable hostname.
     pub hostname: String,
 }
 
 impl MemberRecord {
-    pub fn ip(&self) -> std::net::Ipv4Addr {
-        std::net::Ipv4Addr::from(self.ip)
+    pub fn ipv4(&self) -> Option<Ipv4Addr> {
+        self.addrs.ipv4()
+    }
+
+    pub fn ipv6(&self) -> Option<Ipv6Addr> {
+        self.addrs.ipv6()
+    }
+
+    /// Human readable address list for logs and `status` output.
+    pub fn display_addrs(&self) -> String {
+        self.addrs.display()
+    }
+
+    pub fn empty_addrs(id: IdBytes) -> Self {
+        Self {
+            id,
+            addrs: VirtualAddrs::default(),
+            hostname: String::new(),
+        }
     }
 }
 
@@ -132,28 +174,28 @@ pub enum CtrlMsg {
     AuthHello {
         nonce: [u8; 16],
         proof: [u8; 32],
-        /// Only honored by the network creator: requested virtual IP.
-        desired_ip: Option<u32>,
-        /// The dialer's current virtual IP, if it has one.
-        ip: Option<u32>,
+        /// Only honored by the network creator: requested virtual addresses.
+        desired: VirtualAddrs,
+        /// The dialer's current virtual addresses, if it has any.
+        my_addrs: VirtualAddrs,
         hostname: String,
     },
     /// Successful auth reply, sent by the accepting side.
     AuthAccept {
         nonce: [u8; 16],
         proof: [u8; 32],
-        /// Only set by the network creator: assigned virtual IP.
-        assigned_ip: Option<u32>,
+        /// Only set by the network creator: assigned virtual addresses.
+        assigned: VirtualAddrs,
         /// The accepting side's own member record.
         record: MemberRecord,
     },
     /// Auth failed; connection will be closed.
     AuthReject { reason: String },
-    /// Joiner asks the creator for a virtual IP (e.g. after a conflict).
-    RequestIp { desired: Option<u32> },
-    /// Creator grants a virtual IP.
-    AssignIp { ip: u32 },
-    /// Creator refuses to grant a virtual IP.
+    /// Joiner asks the creator for virtual addresses (e.g. after a conflict).
+    RequestIp { desired: VirtualAddrs },
+    /// Creator grants virtual addresses.
+    AssignIp { addrs: VirtualAddrs },
+    /// Creator refuses to grant virtual addresses.
     RejectIp { reason: String },
 }
 
@@ -168,11 +210,45 @@ pub enum BusMsg {
     LinkState(LinkStateMsg),
 }
 
+/// One link in a link-state advertisement: a neighbor plus the measured
+/// quality of the QUIC connection to it.
+///
+/// All four measurements are EWMA-smoothed before publication. `bw_kbps` is
+/// `0` when the congestion controller has no bandwidth estimate; `tx_kbps`
+/// is the observed QUIC send rate, used to detect a saturated link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkMetric {
+    pub neighbor: IdBytes,
+    /// Smoothed round-trip time in milliseconds.
+    pub rtt_ms: u32,
+    /// Windowed packet loss in permille (0..=1000).
+    pub loss_permille: u32,
+    /// Observed QUIC send throughput in kbit/s.
+    pub tx_kbps: u32,
+    /// Estimated sustainable bandwidth in kbit/s; 0 means unknown.
+    pub bw_kbps: u32,
+}
+
+impl LinkMetric {
+    /// A healthy link with no loss/throughput data yet. Used as the default
+    /// for tests and for peers whose selected path has no statistics.
+    pub fn unknown(neighbor: IdBytes, rtt_ms: u32) -> Self {
+        Self {
+            neighbor,
+            rtt_ms,
+            loss_permille: 0,
+            tx_kbps: 0,
+            bw_kbps: 0,
+        }
+    }
+}
+
 /// Link-state advertisement distributed on the broadcast bus.
 ///
-/// Each node announces the set of mesh neighbors it currently holds. Every
-/// node assembles these into a link-state database and computes its own
-/// next-hop table (see [`crate::routing`]).
+/// Each node announces its current mesh neighbors *and* the measured quality
+/// of each link. Every node assembles these into a link-state database and
+/// derives its own next-hop table with a weighted shortest-path computation
+/// (see [`crate::routing`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkStateMsg {
     /// Endpoint that originated this advertisement.
@@ -180,8 +256,8 @@ pub struct LinkStateMsg {
     /// Monotonically increasing per-origin sequence number; stale (older)
     /// advertisements are ignored.
     pub seq: u64,
-    /// The origin's current mesh neighbors.
-    pub neighbors: Vec<IdBytes>,
+    /// The origin's current mesh links with their measured quality.
+    pub links: Vec<LinkMetric>,
 }
 
 /// Envelope for messages distributed on the flood bus.
@@ -213,6 +289,14 @@ pub enum FrameClass {
 /// Minimum size of an ethernet II frame (dst + src + ethertype).
 pub const ETHERNET_HEADER_LEN: usize = 14;
 
+/// Ethernet II ether types used by diagnostics and the forwarding tests.
+#[allow(dead_code)]
+pub mod ethertype {
+    pub const IPV4: u16 = 0x0800;
+    pub const ARP: u16 = 0x0806;
+    pub const IPV6: u16 = 0x86dd;
+}
+
 /// Parse the destination MAC of a raw ethernet frame.
 pub fn dst_mac(frame: &[u8]) -> Option<[u8; 6]> {
     if frame.len() < ETHERNET_HEADER_LEN {
@@ -221,6 +305,17 @@ pub fn dst_mac(frame: &[u8]) -> Option<[u8; 6]> {
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&frame[..6]);
     Some(mac)
+}
+
+/// EtherType field of an ethernet II frame. Forwarding itself is EtherType
+/// agnostic — this is used by diagnostics and tests to prove IPv6 (0x86dd)
+/// frames, including NDP/MLD, take exactly the same paths as IPv4/ARP.
+#[allow(dead_code)]
+pub fn frame_ethertype(frame: &[u8]) -> Option<u16> {
+    if frame.len() < ETHERNET_HEADER_LEN {
+        return None;
+    }
+    Some(u16::from_be_bytes([frame[12], frame[13]]))
 }
 
 /// Classify a raw ethernet frame for forwarding decisions.
@@ -247,10 +342,20 @@ mod tests {
         f
     }
 
+    /// IPv6 Neighbor Solicitation: solicited-node multicast MAC 33:33:ff:xx.
+    fn ndp_solicit_frame() -> Vec<u8> {
+        let mut f = vec![0x33, 0x33, 0xff, 0, 0, 0x01];
+        f.extend_from_slice(&[0x02, 1, 2, 3, 4, 5]);
+        f.extend_from_slice(&[0x86, 0xdd]); // IPv6
+        f.extend_from_slice(&[0u8; 40]);
+        f
+    }
+
     #[test]
     fn classifies_broadcast() {
         let f = arp_request_frame();
         assert_eq!(classify_frame(&f), Some(FrameClass::Broadcast));
+        assert_eq!(frame_ethertype(&f), Some(ethertype::ARP));
     }
 
     #[test]
@@ -263,6 +368,7 @@ mod tests {
             classify_frame(&f),
             Some(FrameClass::Unicast([0x02, 1, 2, 3, 4, 5]))
         );
+        assert_eq!(frame_ethertype(&f), Some(ethertype::IPV4));
 
         // IPv4 multicast MAC 01:00:5e:...
         let mut m = vec![0x01, 0x00, 0x5e, 0, 0, 1];
@@ -280,9 +386,29 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_frames_are_forwarded_like_ipv4() {
+        // NDP multicast takes the broadcast-bus path.
+        let ndp = ndp_solicit_frame();
+        assert_eq!(frame_ethertype(&ndp), Some(ethertype::IPV6));
+        assert_eq!(classify_frame(&ndp), Some(FrameClass::Multicast));
+
+        // Unicast IPv6 (e.g. ICMPv6 echo / TCP over v6) takes the mesh path.
+        let mut unicast = vec![0x02, 6, 7, 8, 9, 10];
+        unicast.extend_from_slice(&[0x02, 1, 2, 3, 4, 5]);
+        unicast.extend_from_slice(&[0x86, 0xdd]);
+        unicast.extend_from_slice(&[0u8; 40]);
+        assert_eq!(frame_ethertype(&unicast), Some(ethertype::IPV6));
+        assert_eq!(
+            classify_frame(&unicast),
+            Some(FrameClass::Unicast([0x02, 6, 7, 8, 9, 10]))
+        );
+    }
+
+    #[test]
     fn rejects_runt_frames() {
         assert_eq!(classify_frame(&[0u8; 13]), None);
         assert_eq!(dst_mac(&[0u8; 10]), None);
+        assert_eq!(frame_ethertype(&[0u8; 13]), None);
     }
 
     #[test]
@@ -319,11 +445,15 @@ mod tests {
 
     #[test]
     fn ctrl_msg_postcard_roundtrip() {
+        let desired = VirtualAddrs {
+            v4: Some(u32::from(Ipv4Addr::new(10, 13, 37, 42))),
+            v6: Some("fd00::2a".parse::<Ipv6Addr>().unwrap().octets()),
+        };
         let msg = CtrlMsg::AuthHello {
             nonce: [1; 16],
             proof: [2; 32],
-            desired_ip: Some(u32::from(std::net::Ipv4Addr::LOCALHOST)),
-            ip: None,
+            desired,
+            my_addrs: VirtualAddrs::default(),
             hostname: "testhost".into(),
         };
         let bytes = postcard::to_allocvec(&msg).unwrap();
@@ -331,15 +461,39 @@ mod tests {
         match back {
             CtrlMsg::AuthHello {
                 nonce,
-                desired_ip,
+                desired: got,
                 hostname,
                 ..
             } => {
                 assert_eq!(nonce, [1; 16]);
-                assert_eq!(desired_ip, Some(u32::from(std::net::Ipv4Addr::LOCALHOST)));
+                assert_eq!(got, desired);
                 assert_eq!(hostname, "testhost");
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn id_hex_roundtrip_and_malformed_input() {
+        let id = IdBytes([0xab; 32]);
+        assert_eq!(IdBytes::from_hex(&id.hex()), Some(id));
+        assert_eq!(IdBytes::from_hex(""), None);
+        assert_eq!(IdBytes::from_hex(&"00".repeat(31)), None);
+        assert_eq!(IdBytes::from_hex(&"zz".repeat(32)), None);
+    }
+
+    #[test]
+    fn v5_link_metric_postcard_roundtrip() {
+        let m = LinkMetric {
+            neighbor: IdBytes([3; 32]),
+            rtt_ms: 25,
+            loss_permille: 12,
+            tx_kbps: 4_000,
+            bw_kbps: 10_000,
+        };
+        let bytes = postcard::to_allocvec(&m).unwrap();
+        assert_eq!(postcard::from_bytes::<LinkMetric>(&bytes).unwrap(), m);
+        // 32-byte id + four varints: still small enough for a gossip LSA.
+        assert!(bytes.len() < 64);
     }
 }

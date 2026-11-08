@@ -4,10 +4,10 @@
 //! * MAC routing table — the virtual MAC is derived from the endpoint id, so
 //!   `mac -> EndpointId` lookups drive all unicast forwarding.
 //! * Announcement state — entries expire unless refreshed periodically.
-//! * The `ip -> hostname` view shown by `irohlan status`.
+//! * The `address -> hostname` view shown by `irohlan status`.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -78,7 +78,11 @@ impl Membership {
     }
 
     pub fn get(&self, id: &IdBytes) -> Option<MemberInfo> {
-        self.peers.read().expect("membership lock poisoned").get(id).cloned()
+        self.peers
+            .read()
+            .expect("membership lock poisoned")
+            .get(id)
+            .cloned()
     }
 
     /// Resolve a destination MAC to a member record. `None` means the frame
@@ -91,19 +95,27 @@ impl Membership {
             .cloned()
     }
 
-    /// Resolve a virtual IP to a member record (self excluded).
-    /// Used by tests; kept as part of the lookup surface.
+    /// Resolve a virtual IPv4 or IPv6 address to a member record (self
+    /// excluded). Used by tests; kept as part of the lookup surface.
     #[allow(dead_code)]
-    pub fn by_ip(&self, ip: Ipv4Addr) -> Option<MemberInfo> {
+    pub fn by_ip(&self, ip: IpAddr) -> Option<MemberInfo> {
         let peers = self.peers.read().expect("membership lock poisoned");
         peers
             .values()
-            .find(|info| info.record.ip() == ip)
+            .find(|info| match ip {
+                IpAddr::V4(v4) => info.record.ipv4() == Some(v4),
+                IpAddr::V6(v6) => info.record.ipv6() == Some(v6),
+            })
             .cloned()
     }
 
     pub fn all(&self) -> Vec<MemberInfo> {
-        self.peers.read().expect("membership lock poisoned").values().cloned().collect()
+        self.peers
+            .read()
+            .expect("membership lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     #[allow(dead_code)] // used by tests and future status output
@@ -120,43 +132,70 @@ impl Membership {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::netaddr::VirtualAddrs;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
-    fn rec(seed: u8, ip: u32) -> MemberRecord {
+    fn rec(seed: u8, addrs: VirtualAddrs) -> MemberRecord {
         MemberRecord {
             id: IdBytes([seed; 32]),
-            ip,
+            addrs,
             hostname: format!("host-{seed}"),
+        }
+    }
+
+    fn dual(offset: u8) -> VirtualAddrs {
+        VirtualAddrs {
+            v4: Some(u32::from(Ipv4Addr::new(10, 13, 37, offset))),
+            v6: Some(
+                format!("fd00::{offset:x}")
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            ),
         }
     }
 
     #[test]
     fn upsert_and_lookup_by_mac_and_ip() {
         let m = Membership::new();
-        let r = rec(1, u32::from(Ipv4Addr::new(10, 13, 37, 2)));
+        let r = rec(1, dual(2));
         assert!(m.upsert(r.clone()), "first insert reports new");
         assert!(!m.upsert(r.clone()), "refresh reports unchanged");
 
         let mac = crate::crypto::mac_from_id(r.id.as_bytes());
         assert_eq!(m.by_mac(&mac).unwrap().record, r);
-        assert_eq!(m.by_ip(Ipv4Addr::new(10, 13, 37, 2)).unwrap().record, r);
+        assert_eq!(
+            m.by_ip(IpAddr::V4(Ipv4Addr::new(10, 13, 37, 2)))
+                .unwrap()
+                .record,
+            r
+        );
+        assert_eq!(
+            m.by_ip(IpAddr::V6("fd00::2".parse().unwrap()))
+                .unwrap()
+                .record,
+            r
+        );
         assert!(m.by_mac(&[0xaa; 6]).is_none());
-        assert!(m.by_ip(Ipv4Addr::new(10, 13, 37, 99)).is_none());
+        assert!(m.by_ip(IpAddr::V4(Ipv4Addr::new(10, 13, 37, 99))).is_none());
     }
 
     #[test]
     fn ip_change_is_reported_and_updated() {
         let m = Membership::new();
-        m.upsert(rec(1, u32::from(Ipv4Addr::new(10, 13, 37, 2))));
-        assert!(m.upsert(rec(1, u32::from(Ipv4Addr::new(10, 13, 37, 3)))));
-        assert!(m.by_ip(Ipv4Addr::new(10, 13, 37, 3)).is_some());
-        assert!(m.by_ip(Ipv4Addr::new(10, 13, 37, 2)).is_none());
+        m.upsert(rec(1, dual(2)));
+        assert!(m.upsert(rec(1, dual(3))));
+        assert!(m.by_ip(IpAddr::V4(Ipv4Addr::new(10, 13, 37, 3))).is_some());
+        assert!(m.by_ip(IpAddr::V6("fd00::3".parse().unwrap())).is_some());
+        assert!(m.by_ip(IpAddr::V4(Ipv4Addr::new(10, 13, 37, 2))).is_none());
+        assert!(m.by_ip(IpAddr::V6("fd00::2".parse().unwrap())).is_none());
     }
 
     #[test]
     fn expire_drops_only_stale_entries() {
         let m = Membership::new();
-        m.upsert(rec(1, 1));
-        m.upsert(rec(2, 2));
+        m.upsert(rec(1, dual(2)));
+        m.upsert(rec(2, dual(3)));
         assert_eq!(m.expire().len(), 0, "fresh entries survive");
 
         // age all entries beyond the TTL

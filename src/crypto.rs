@@ -136,6 +136,9 @@ mod tests {
 
     #[test]
     fn mac_formatting() {
-        assert_eq!(format_mac(&[0x02, 0x0a, 0xb, 0, 0xff, 1]), "02:0a:0b:00:ff:01");
+        assert_eq!(
+            format_mac(&[0x02, 0x0a, 0xb, 0, 0xff, 1]),
+            "02:0a:0b:00:ff:01"
+        );
     }
 }

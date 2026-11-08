@@ -256,7 +256,10 @@ mod tests {
         assert!(!ring.mark(&origin, 0), "duplicate is rejected");
         assert!(ring.mark(&origin, 1));
         let other = IdBytes([2; 32]);
-        assert!(ring.mark(&other, 0), "same seq from another origin is fresh");
+        assert!(
+            ring.mark(&other, 0),
+            "same seq from another origin is fresh"
+        );
 
         // Eviction: insert until beyond capacity, the oldest entry is dropped.
         for seq in 2..(FLOOD_DEDUP_CAP as u64 + 10) {

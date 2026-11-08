@@ -4,17 +4,22 @@
 //! read from it are full ethernet frames, exactly what we tunnel through the
 //! iroh mesh. Creating and configuring the device requires `CAP_NET_ADMIN`
 //! (run as root or use `setcap cap_net_admin+ep`).
+//!
+//! Forwarding is EtherType agnostic: IPv4, ARP, IPv6, NDP and MLD frames all
+//! traverse the same switch. The device is configured with both address
+//! families so the host stack can use either one (or both).
 
-use std::net::Ipv4Addr;
+use crate::netaddr::{AddrPlan, VirtualAddrs};
 
 /// Default MTU for the virtual ethernet device.
 ///
-/// 1500 matches a regular Ethernet network, so the host protocol stack never
-/// fragments and path-MTU blackholes are avoided. Frames larger than the QUIC
-/// datagram limit (~1200 bytes of payload on a 1500-byte path) automatically
-/// take the uni-stream overflow path in `mesh::send_payload` — one stream per
-/// frame, so there is no head-of-line blocking between frames. Smaller frames
-/// (ARP, TCP ACKs, small packets) keep using the datagram fast path.
+/// 1500 matches a regular Ethernet network and is above the 1280-byte minimum
+/// IPv6 link MTU, so the host protocol stack never fragments and path-MTU
+/// blackholes are avoided. Frames larger than the QUIC datagram limit (~1200
+/// bytes of payload on a 1500-byte path) automatically take the uni-stream
+/// overflow path in `mesh::send_payload` — one stream per frame, so there is
+/// no head-of-line blocking between frames. Smaller frames (ARP, NDP, TCP
+/// ACKs, small packets) keep using the datagram fast path.
 pub const DEFAULT_MTU: u16 = 1500;
 
 /// Async handle to a TAP device.
@@ -38,7 +43,10 @@ impl TapDevice {
         let mut builder = tun_rs::DeviceBuilder::new()
             .layer(tun_rs::Layer::L2)
             .mtu(mtu)
-            .mac_addr(mac);
+            .mac_addr(mac)
+            // Bring the interface up explicitly: IPv6 addresses need an UP
+            // device for DAD (duplicate address detection) to complete.
+            .enable(true);
         if let Some(name) = name {
             builder = builder.name(name);
         }
@@ -52,9 +60,17 @@ impl TapDevice {
         &self.name
     }
 
-    /// Assign our virtual IPv4 address with prefix length (e.g. 24 for /24).
-    pub fn set_ipv4(&self, ip: Ipv4Addr, prefix: u8) -> std::io::Result<()> {
-        self.dev.add_address_v4(ip, prefix)
+    /// Assign our virtual addresses (IPv4 and/or IPv6) with their prefixes.
+    pub fn configure(&self, addrs: &VirtualAddrs, plan: &AddrPlan) -> std::io::Result<()> {
+        if let (Some(ip), Some(net)) = (addrs.ipv4(), plan.v4) {
+            tracing::info!(ip = %ip, prefix = net.prefix, "configuring IPv4 address");
+            self.dev.add_address_v4(ip, net.prefix)?;
+        }
+        if let (Some(ip), Some(net)) = (addrs.ipv6(), plan.v6) {
+            tracing::info!(ip = %ip, prefix = net.prefix, "configuring IPv6 address");
+            self.dev.add_address_v6(ip, net.prefix)?;
+        }
+        Ok(())
     }
 
     /// Read one ethernet frame into `buf`, returning its length.
@@ -91,7 +107,7 @@ impl TapDevice {
         "n/a"
     }
 
-    pub fn set_ipv4(&self, _ip: Ipv4Addr, _prefix: u8) -> std::io::Result<()> {
+    pub fn configure(&self, _addrs: &VirtualAddrs, _plan: &AddrPlan) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "not supported on this platform",

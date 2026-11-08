@@ -1,3 +1,8 @@
 /target
 *.log
 .zcode/
+__pycache__/
+*.pyc
+/bench-results/
+# WorkBuddy workspace memory is local session data, not project code.
+/.workbuddy/

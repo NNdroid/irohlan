@@ -16,7 +16,6 @@
 //! (passphrase) before the connection is registered for data forwarding.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -32,9 +31,11 @@ use tokio::time::timeout;
 use crate::allocator::Allocator;
 use crate::crypto;
 use crate::membership::Membership;
+use crate::netaddr::VirtualAddrs;
 use crate::proto::{
-    lenframe, tag, CtrlMsg, FloodEnvelope, IdBytes, MemberRecord, MAX_STREAM_MSG_LEN,
+    lenframe, tag, CtrlMsg, FloodEnvelope, IdBytes, LinkMetric, MemberRecord, MAX_STREAM_MSG_LEN,
 };
+use crate::routing::{ewma, MAX_RTT_MS, UNKNOWN_RTT_MS};
 
 /// Timeout for the auth handshake on a new connection.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,22 +57,29 @@ pub enum MeshEvent {
 #[derive(Debug)]
 pub struct DialOutcome {
     pub remote: MemberRecord,
-    /// IP assigned to us when the remote is the network creator.
-    pub assigned_ip: Option<Ipv4Addr>,
+    /// Addresses assigned to us when the remote is the network creator.
+    pub assigned_addrs: VirtualAddrs,
 }
 
 /// A unicast frame received from a peer, with its remaining hop budget.
 ///
 /// The switch delivers frames addressed to us to the TAP and relays the rest
-/// (partial-mesh multi-hop forwarding, see [`crate::routing`]).
+/// (partial-mesh multi-hop forwarding, see [`crate::routing`]). `from` is the
+/// authenticated QUIC peer that sent the frame (the previous hop, not
+/// necessarily the original source); the switch uses it for relay accounting.
+/// It comes from the connection itself, so the wire format is unchanged.
 #[derive(Debug)]
 pub struct InboundFrame {
+    pub from: EndpointId,
     pub hop: u8,
     pub frame: Bytes,
 }
 
 enum OutMsg {
-    Frame { hop: u8, frame: Bytes },
+    Frame {
+        hop: u8,
+        frame: Bytes,
+    },
     /// Tagged payload ready for the wire (datagram or stream).
     Tagged(Vec<u8>),
 }
@@ -82,6 +90,18 @@ struct PeerHandle {
     out_tx: mpsc::Sender<OutMsg>,
 }
 
+/// Cumulative QUIC counters from the previous link-quality sample. Loss and
+/// throughput are derived by differencing these between LSA refreshes.
+#[derive(Clone, Copy, Debug)]
+struct LinkSample {
+    at: Instant,
+    sent_packets: u64,
+    lost_packets: u64,
+    sent_bytes: u64,
+    loss_permille: u32,
+    tx_kbps: u32,
+}
+
 /// State shared between the router handler, the pumps and [`Mesh`].
 struct Shared {
     endpoint: Endpoint,
@@ -89,11 +109,13 @@ struct Shared {
     is_creator: bool,
     my_id: EndpointId,
     my_hostname: String,
-    my_ip: RwLock<u32>,
+    my_addrs: RwLock<VirtualAddrs>,
     /// Creator-only lease allocator.
     allocator: Option<tokio::sync::Mutex<Allocator>>,
     membership: Arc<Membership>,
     peers: Mutex<HashMap<EndpointId, Vec<Arc<PeerHandle>>>>,
+    /// Previous QUIC counter snapshot per peer for windowed loss/throughput.
+    link_samples: Mutex<HashMap<EndpointId, LinkSample>>,
     bans: Mutex<HashMap<EndpointId, Instant>>,
     /// Unicast frames received from remote peers (with hop budget).
     frame_tx: mpsc::Sender<InboundFrame>,
@@ -230,6 +252,15 @@ impl AuthError {
     }
 }
 
+/// Our own member record, used in handshakes and periodic announcements.
+fn my_record(shared: &Shared) -> MemberRecord {
+    MemberRecord {
+        id: IdBytes::from(shared.my_id),
+        addrs: *shared.my_addrs.read().expect("my_addrs lock"),
+        hostname: shared.my_hostname.clone(),
+    }
+}
+
 /// Responder half of the auth handshake. Returns the initiator's member
 /// record so the caller can register it.
 async fn auth_responder(shared: &Shared, conn: &Connection) -> anyhow::Result<MemberRecord> {
@@ -238,8 +269,8 @@ async fn auth_responder(shared: &Shared, conn: &Connection) -> anyhow::Result<Me
     let CtrlMsg::AuthHello {
         nonce,
         proof,
-        desired_ip,
-        ip: remote_ip,
+        desired,
+        my_addrs: remote_addrs,
         hostname,
     } = postcard::from_bytes(&raw)?
     else {
@@ -258,29 +289,25 @@ async fn auth_responder(shared: &Shared, conn: &Connection) -> anyhow::Result<Me
         return Err(AuthError::fail());
     }
 
-    // The creator assigns (or confirms) the joiner's virtual IP.
-    let assigned_ip = if shared.is_creator {
+    // The creator assigns (or confirms) the joiner's virtual addresses.
+    let assigned = if shared.is_creator {
         let mut alloc = shared
             .allocator
             .as_ref()
             .expect("creator has an allocator")
             .lock()
             .await;
-        match alloc.assign(
-            IdBytes::from(remote),
-            &hostname,
-            desired_ip.map(Ipv4Addr::from),
-        ) {
-            Ok(ip) => Some(ip),
+        match alloc.assign(IdBytes::from(remote), &hostname, desired) {
+            Ok(addrs) => addrs,
             Err(reason) => {
                 let reply = CtrlMsg::AuthReject { reason };
                 lenframe::write(&mut send, &postcard::to_allocvec(&reply)?).await?;
                 send.finish().ok();
-                return Err(anyhow::anyhow!("ip allocation refused"));
+                return Err(anyhow::anyhow!("address allocation refused"));
             }
         }
     } else {
-        None
+        VirtualAddrs::default()
     };
 
     let reply_nonce = crypto::nonce();
@@ -294,23 +321,20 @@ async fn auth_responder(shared: &Shared, conn: &Connection) -> anyhow::Result<Me
     let reply = CtrlMsg::AuthAccept {
         nonce: reply_nonce,
         proof: reply_proof,
-        assigned_ip: assigned_ip.map(u32::from),
-        record: MemberRecord {
-            id: IdBytes::from(shared.my_id),
-            ip: *shared.my_ip.read().expect("my_ip lock"),
-            hostname: shared.my_hostname.clone(),
-        },
+        assigned,
+        record: my_record(shared),
     };
     lenframe::write(&mut send, &postcard::to_allocvec(&reply)?).await?;
     send.finish().ok();
 
-    let effective_ip = assigned_ip
-        .map(u32::from)
-        .or(remote_ip)
-        .unwrap_or(0);
+    let effective = if assigned.is_empty() {
+        remote_addrs
+    } else {
+        assigned
+    };
     Ok(MemberRecord {
         id: IdBytes::from(remote),
-        ip: effective_ip,
+        addrs: effective,
         hostname,
     })
 }
@@ -319,8 +343,8 @@ async fn auth_responder(shared: &Shared, conn: &Connection) -> anyhow::Result<Me
 async fn auth_initiator(
     shared: &Shared,
     conn: &Connection,
-    desired_ip: Option<Ipv4Addr>,
-) -> anyhow::Result<(MemberRecord, Option<Ipv4Addr>)> {
+    desired: VirtualAddrs,
+) -> anyhow::Result<(MemberRecord, VirtualAddrs)> {
     let (mut send, mut recv) = conn.open_bi().await?;
     let nonce = crypto::nonce();
     let proof = crypto::auth_proof(
@@ -330,12 +354,11 @@ async fn auth_initiator(
         &nonce,
         crypto::ROLE_INITIATOR,
     );
-    let my_ip = *shared.my_ip.read().expect("my_ip lock");
     let hello = CtrlMsg::AuthHello {
         nonce,
         proof,
-        desired_ip: desired_ip.map(u32::from),
-        ip: (my_ip != 0).then_some(my_ip),
+        desired,
+        my_addrs: *shared.my_addrs.read().expect("my_addrs lock"),
         hostname: shared.my_hostname.clone(),
     };
     lenframe::write(&mut send, &postcard::to_allocvec(&hello)?).await?;
@@ -346,7 +369,7 @@ async fn auth_initiator(
         CtrlMsg::AuthAccept {
             nonce,
             proof,
-            assigned_ip,
+            assigned,
             record,
         } => {
             let expected = crypto::auth_proof(
@@ -359,7 +382,7 @@ async fn auth_initiator(
             if expected != proof {
                 return Err(AuthError::fail());
             }
-            Ok((record, assigned_ip.map(Ipv4Addr::from)))
+            Ok((record, assigned))
         }
         CtrlMsg::AuthReject { reason } => Err(anyhow::anyhow!("rejected: {reason}")),
         other => Err(anyhow::anyhow!("unexpected auth reply: {other:?}")),
@@ -399,12 +422,8 @@ async fn handle_ctrl(shared: &Shared, remote: EndpointId, msg: CtrlMsg) -> CtrlM
                 .expect("creator has an allocator")
                 .lock()
                 .await;
-            match alloc.assign(
-                IdBytes::from(remote),
-                &hostname,
-                desired.map(Ipv4Addr::from),
-            ) {
-                Ok(ip) => CtrlMsg::AssignIp { ip: u32::from(ip) },
+            match alloc.assign(IdBytes::from(remote), &hostname, desired) {
+                Ok(addrs) => CtrlMsg::AssignIp { addrs },
                 Err(reason) => CtrlMsg::RejectIp { reason },
             }
         }
@@ -536,12 +555,11 @@ fn ingest_tagged(shared: &Shared, from: &EndpointId, data: &[u8]) {
             let Some((&hop, frame)) = rest.split_first() else {
                 return;
             };
-            let _ = shared
-                .frame_tx
-                .try_send(InboundFrame {
-                    hop,
-                    frame: Bytes::copy_from_slice(frame),
-                });
+            let _ = shared.frame_tx.try_send(InboundFrame {
+                from: *from,
+                hop,
+                frame: Bytes::copy_from_slice(frame),
+            });
         }
         tag::FLOOD => match postcard::from_bytes::<FloodEnvelope>(rest) {
             Ok(envelope) => {
@@ -597,18 +615,23 @@ impl Mesh {
             is_creator: cfg.is_creator,
             my_id,
             my_hostname: cfg.my_hostname,
-            my_ip: RwLock::new(0),
+            my_addrs: RwLock::new(VirtualAddrs::default()),
             allocator: cfg.allocator.map(tokio::sync::Mutex::new),
             membership: cfg.membership,
             peers: Mutex::new(HashMap::new()),
+            link_samples: Mutex::new(HashMap::new()),
             bans: Mutex::new(HashMap::new()),
             frame_tx,
             flood_tx,
             event_tx,
         });
 
-        let mut router_builder = Router::builder(cfg.endpoint.clone())
-            .accept(crate::proto::ALPN, Handler { shared: shared.clone() });
+        let mut router_builder = Router::builder(cfg.endpoint.clone()).accept(
+            crate::proto::ALPN,
+            Handler {
+                shared: shared.clone(),
+            },
+        );
         if let Some(gossip) = cfg.gossip {
             router_builder = router_builder.accept(iroh_gossip::ALPN, gossip);
         }
@@ -637,15 +660,11 @@ impl Mesh {
     }
 
     pub fn my_record(&self) -> MemberRecord {
-        MemberRecord {
-            id: IdBytes::from(self.shared.my_id),
-            ip: *self.shared.my_ip.read().expect("my_ip lock"),
-            hostname: self.shared.my_hostname.clone(),
-        }
+        my_record(&self.shared)
     }
 
-    pub fn set_my_ip(&self, ip: Ipv4Addr) {
-        *self.shared.my_ip.write().expect("my_ip lock") = u32::from(ip);
+    pub fn set_my_addrs(&self, addrs: VirtualAddrs) {
+        *self.shared.my_addrs.write().expect("my_addrs lock") = addrs;
     }
 
     /// Whether we hold at least one live connection to `id`.
@@ -668,11 +687,92 @@ impl Mesh {
             .collect()
     }
 
+    /// Measured QUIC link quality for every directly connected peer.
+    ///
+    /// Reads the currently selected path, so a link that migrated from relay
+    /// to direct (or back) is reflected automatically. RTT and the congestion
+    /// controller's bandwidth estimate are instantaneous; loss and observed
+    /// send throughput are cumulative counters, so they are differenced
+    /// against the previous sample and EWMA-smoothed here (the LSA smoother
+    /// then applies a second EWMA with the same time constant).
+    pub fn neighbor_link_metrics(&self) -> Vec<LinkMetric> {
+        let peers = self.shared.peers.lock().expect("peers lock");
+        let mut samples = self.shared.link_samples.lock().expect("link samples lock");
+        let now = Instant::now();
+        let mut out = Vec::with_capacity(peers.len());
+
+        for (id, handles) in peers.iter() {
+            let Some(handle) = handles.first() else {
+                continue;
+            };
+            let paths = handle.conn.paths();
+            let Some(path) = paths.iter().find(|p| p.is_selected()) else {
+                let mut m = LinkMetric::unknown(IdBytes::from(*id), UNKNOWN_RTT_MS);
+                if let Some(prev) = samples.get(id) {
+                    m.loss_permille = prev.loss_permille;
+                    m.tx_kbps = prev.tx_kbps;
+                }
+                out.push(m);
+                continue;
+            };
+            let stats = path.stats();
+            let rtt_ms = stats.rtt.as_millis().clamp(1, u128::from(MAX_RTT_MS)) as u32;
+            let bw_kbps = stats
+                .bandwidth_estimate
+                .map(|bits| (bits / 1000).min(u128::from(u32::MAX) as u64) as u32)
+                .unwrap_or(0);
+
+            let (loss_permille, tx_kbps) = match samples.get(id) {
+                Some(prev)
+                    if stats.sent_packets >= prev.sent_packets
+                        && stats.lost_packets >= prev.lost_packets
+                        && stats.sent_bytes >= prev.sent_bytes =>
+                {
+                    let elapsed_us = now.saturating_duration_since(prev.at).as_micros().max(1);
+                    let sent = stats.sent_packets - prev.sent_packets;
+                    let lost = (stats.lost_packets - prev.lost_packets).min(sent);
+                    let bytes = stats.sent_bytes - prev.sent_bytes;
+                    let loss = if sent > 0 {
+                        (u128::from(lost) * 1000 / u128::from(sent)).min(1000) as u32
+                    } else {
+                        prev.loss_permille
+                    };
+                    // bytes * 8 bits / 1000 (kbit) * 1e6 / micros (/s).
+                    let tx =
+                        ((u128::from(bytes) * 8_000 / elapsed_us).min(u128::from(u32::MAX))) as u32;
+                    (ewma(prev.loss_permille, loss), ewma(prev.tx_kbps, tx))
+                }
+                // First sample, or a connection/path reset: no window yet.
+                _ => (0, 0),
+            };
+            samples.insert(
+                *id,
+                LinkSample {
+                    at: now,
+                    sent_packets: stats.sent_packets,
+                    lost_packets: stats.lost_packets,
+                    sent_bytes: stats.sent_bytes,
+                    loss_permille,
+                    tx_kbps,
+                },
+            );
+            out.push(LinkMetric {
+                neighbor: IdBytes::from(*id),
+                rtt_ms,
+                loss_permille,
+                tx_kbps,
+                bw_kbps,
+            });
+        }
+        samples.retain(|id, _| peers.contains_key(id));
+        out
+    }
+
     /// Dial a peer, authenticate, and register the connection.
     pub async fn dial(
         &self,
         addr: EndpointAddr,
-        desired_ip: Option<Ipv4Addr>,
+        desired: VirtualAddrs,
     ) -> anyhow::Result<DialOutcome> {
         let remote = addr.id;
         if self.is_connected(&remote) {
@@ -681,14 +781,10 @@ impl Mesh {
                 .membership
                 .get(&IdBytes::from(remote))
                 .map(|m| m.record)
-                .unwrap_or(MemberRecord {
-                    id: IdBytes::from(remote),
-                    ip: 0,
-                    hostname: String::new(),
-                });
+                .unwrap_or_else(|| MemberRecord::empty_addrs(IdBytes::from(remote)));
             return Ok(DialOutcome {
                 remote: record,
-                assigned_ip: None,
+                assigned_addrs: VirtualAddrs::default(),
             });
         }
         let conn = self
@@ -697,7 +793,7 @@ impl Mesh {
             .connect(addr, crate::proto::ALPN)
             .await
             .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-        let (record, assigned_ip) = auth_initiator(&self.shared, &conn, desired_ip).await?;
+        let (record, assigned_addrs) = auth_initiator(&self.shared, &conn, desired).await?;
         register_conn(&self.shared, conn.clone());
         self.shared.membership.upsert(record.clone());
         let _ = self.shared.event_tx.send(MeshEvent::PeerUp(remote));
@@ -712,7 +808,7 @@ impl Mesh {
 
         Ok(DialOutcome {
             remote: record,
-            assigned_ip,
+            assigned_addrs,
         })
     }
 
