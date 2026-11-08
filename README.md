@@ -306,11 +306,15 @@ ping 0% 丢包 0.364 ms;relay/clean TCP ≈ 8.4 Mbit/s,符合 2048 KiB/s 上限)
 硬超时兜底。
 
 harness 还要求 overlay **连续 3 次 ping 成功**才算就绪(单次成功可能是刚建链时
-的偶然回包),并在每个弱网档位开始前先清掉上一档的 qdisc、再探一次活;overlay
-中途挂掉会立刻判该 mode 失败并落诊断,而不是把一堆空测量结果记成「弱网表现」。
+的偶然回包),并在每个弱网档位开始前先清掉上一档的 qdisc、再探一次活;这一次探活
+是**带重试**的(默认 20 次 × 2 秒,可用 `BENCH_OVERLAY_RETRIES` /
+`BENCH_OVERLAY_RETRY_INTERVAL` 覆盖):上一档 netem 可能刚把某条 relay QUIC 链路
+压断,节点正在按指数退避重拨,单次 ping 失败不能当成 overlay 已死。只有重试全部
+用尽、overlay 仍然不通,才判该 mode 失败并落诊断,而不是把一堆空测量结果记成
+「弱网表现」。
 环境变量可覆盖 `BENCH_ROOT`、`BENCH_MTU`、`BENCH_READY_TIMEOUT`、
-`BENCH_READY_STREAK`、`BENCH_PROBE_TIMEOUT`、`BENCH_PING_COUNT`、
-`BENCH_IPERF_SERVER_SECS`。
+`BENCH_READY_STREAK`、`BENCH_OVERLAY_RETRIES`、`BENCH_OVERLAY_RETRY_INTERVAL`、
+`BENCH_PING_COUNT`、`BENCH_IPERF_SERVER_SECS`。
 
 前置条件:root、`/dev/net/tun`、`iproute2`(`ip` + `tc`)、`iperf3`、
 `iputils-ping`、`python3`、`coreutils`。
@@ -482,6 +486,10 @@ ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mo
   `mobile` 档(每跳 80ms±30ms / 3% 丢包 / 8mbit)叠加 2048 KiB/s 中继上限时,
   60 秒 TTL 过后 ARP 直接报 `Destination Host Unreachable`。缩小成员公告间隔或
   提高 TTL 可缓解,但会牺牲收敛开销;目前把它如实记进 benchmark 报告
+- **relay QUIC 链路掉线后由拨号方自动重连(指数退避 1s→30s 上限),真实部署与
+  弱网 benchmark 均受益**:mesh 会记住自己拨出去的对端地址,连接一断就按
+  1s/2s/4s…30s 重拨,重新握手成功后自动回到数据面;只有「发起连接的一方」会重拨,
+  接受方不主动回拨(它手里没有对端的可拨地址),所以两端同时掉线时由发起方恢复
 - 目前仅支持 Linux;Windows(需 tap-windows6 驱动)在路线图上
 - 一个主机同时只属于一个虚拟网络
 - 链路质量全部来自 QUIC 选中路径的统计,不是主动探测:RTT 是 QUIC 的平滑估计,

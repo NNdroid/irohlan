@@ -46,8 +46,8 @@ Profiles are applied with `tc netem` on every veth hop, i.e. on the QUIC
 underlay, not on the emulated TAP frames. The harness always uses the flood
 broadcast bus: gossip needs address lookup that an isolated netns cannot
 provide. Environment overrides: BENCH_ROOT, BENCH_MTU, BENCH_READY_TIMEOUT,
-BENCH_READY_STREAK, BENCH_PROBE_TIMEOUT, BENCH_PING_COUNT,
-BENCH_IPERF_SERVER_SECS, BENCH_IPERF_CLIENT_EXTRA.
+BENCH_READY_STREAK, BENCH_OVERLAY_RETRIES, BENCH_OVERLAY_RETRY_INTERVAL,
+BENCH_PING_COUNT, BENCH_IPERF_SERVER_SECS, BENCH_IPERF_CLIENT_EXTRA.
 EOF
 }
 
@@ -126,11 +126,13 @@ for mode in "${MODES[@]}"; do
         mkdir -p "$local_out"
         bench_log "--- $mode / $profile ---"
         # Check on a clean underlay: a broken overlay must not be reported
-        # as "weak network" measurements. Fail the mode early and keep the
-        # diagnostics instead of collecting a screen full of empty rows.
+        # as "weak network" measurements. The check retries for a while
+        # because the mesh may still be redialing a link that the previous
+        # profile knocked out; only a mode that stays unreachable is failed,
+        # and we keep the diagnostics instead of a screen of empty rows.
         bench_clear_netem
         if ! bench_check_overlay; then
-            bench_log "overlay stopped working before $mode/$profile"
+            bench_log "overlay still down before $mode/$profile after $BENCH_OVERLAY_RETRIES probes"
             bench_dump_diagnostics "$(bench_server_node)" \
                 "$(vip_of "$(bench_server_node)")" \
                 "$(state_of "$(bench_server_node)")/status.json"

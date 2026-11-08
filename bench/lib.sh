@@ -38,8 +38,12 @@ BENCH_READY_TIMEOUT="${BENCH_READY_TIMEOUT:-90}"
 # A single lucky echo reply is not enough: the first CI run had a working
 # overlay for one ping and then lost it. Require consecutive successes.
 BENCH_READY_STREAK="${BENCH_READY_STREAK:-3}"
-# Short per-profile liveness check, used before netem is (re)applied.
-BENCH_PROBE_TIMEOUT="${BENCH_PROBE_TIMEOUT:-10}"
+# Per-profile liveness check. A relay link that dropped under the previous
+# profile is redialed by the node itself, so one failed ping right after the
+# qdisc is cleared is expected, not a dead overlay. 20 x 2s comfortably covers
+# the mesh's 30s backoff ceiling plus a QUIC handshake on an impaired path.
+BENCH_OVERLAY_RETRIES="${BENCH_OVERLAY_RETRIES:-20}"
+BENCH_OVERLAY_RETRY_INTERVAL="${BENCH_OVERLAY_RETRY_INTERVAL:-2}"
 BENCH_PING_COUNT="${BENCH_PING_COUNT:-20}"
 # status.json is written every 5s; wait for one more tick before collecting
 # so the "after" snapshot includes the whole measurement window.
@@ -441,16 +445,26 @@ bench_wait_ready() {
     return 0
 }
 
-# Cheap per-profile liveness check. The caller clears the previous profile's
-# qdisc first, so an intentional loss profile cannot cause a false negative.
+# Per-profile liveness check, run after the previous profile's qdisc has been
+# cleared. A dropped QUIC link is redialed by the node that initiated it, and
+# the retry schedule backs off up to 30s, so a single failed ping proves
+# nothing. Retry for BENCH_OVERLAY_RETRIES attempts before giving up; the
+# semantics stay the same -- a mode is only failed when the overlay is still
+# unreachable after every attempt.
 bench_check_overlay() {
-    local ip i
+    local ip attempt
     ip=$(vip_of "$(bench_server_node)")
-    for ((i = 0; i < BENCH_PROBE_TIMEOUT; i++)); do
+    for ((attempt = 1; attempt <= BENCH_OVERLAY_RETRIES; attempt++)); do
         if bench_ping_once "$ip"; then
+            if ((attempt > 1)); then
+                bench_log "overlay recovered after $((attempt - 1)) failed probe(s) (~$(((attempt - 1) * BENCH_OVERLAY_RETRY_INTERVAL))s)"
+            fi
             return 0
         fi
-        sleep 1
+        if ((attempt < BENCH_OVERLAY_RETRIES)); then
+            bench_log "overlay probe $attempt/$BENCH_OVERLAY_RETRIES failed; waiting ${BENCH_OVERLAY_RETRY_INTERVAL}s for the mesh to redial"
+            sleep "$BENCH_OVERLAY_RETRY_INTERVAL"
+        fi
     done
     return 1
 }

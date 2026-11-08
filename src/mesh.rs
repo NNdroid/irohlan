@@ -15,7 +15,7 @@
 //! On top of that, both sides must prove knowledge of the network key
 //! (passphrase) before the connection is registered for data forwarding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -45,6 +45,14 @@ const BAN_TTL: Duration = Duration::from_secs(60);
 const OUT_QUEUE_CAP: usize = 1024;
 /// Bound on events emitted to node-level subscribers.
 const EVENT_CAP: usize = 64;
+/// Bound on queued reconnect requests (one per peer, deduplicated by the
+/// `reconnecting` set, so this only needs to absorb a burst of drops).
+const RECONNECT_QUEUE_CAP: usize = 64;
+/// First retry delay when a dialed link went down; doubles up to the cap.
+const RECONNECT_MIN_BACKOFF: Duration = Duration::from_secs(1);
+/// Upper bound on the retry delay. netem runs of several minutes can keep a
+/// link unusable for a while, and the reconnect must not spin on it.
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Events emitted when mesh connections come and go.
 #[derive(Clone, Copy, Debug)]
@@ -114,6 +122,18 @@ struct Shared {
     allocator: Option<tokio::sync::Mutex<Allocator>>,
     membership: Arc<Membership>,
     peers: Mutex<HashMap<EndpointId, Vec<Arc<PeerHandle>>>>,
+    /// Peers we dialed ourselves, with the exact address we reached them at.
+    ///
+    /// Only the dialer may redial: iroh does not retry a closed connection,
+    /// and a responder has no address for us to dial (the QUIC peer id alone
+    /// needs an address lookup that isolated networks do not have). This map
+    /// is therefore both the reconnect target list and the "am I the dialer?"
+    /// marker — the accept side never has an entry and silently skips.
+    dial_targets: Mutex<HashMap<EndpointId, (EndpointAddr, VirtualAddrs)>>,
+    /// Peers that already have a reconnect task running (dedup).
+    reconnecting: Mutex<HashSet<EndpointId>>,
+    /// Hands reconnect requests to the reconnect worker.
+    reconnect_tx: mpsc::Sender<(EndpointAddr, VirtualAddrs)>,
     /// Previous QUIC counter snapshot per peer for windowed loss/throughput.
     link_samples: Mutex<HashMap<EndpointId, LinkSample>>,
     bans: Mutex<HashMap<EndpointId, Instant>>,
@@ -190,6 +210,54 @@ impl Shared {
             }
         }
     }
+
+    /// Whether at least one live connection to `id` is registered.
+    fn has_peer(&self, id: &EndpointId) -> bool {
+        self.peers
+            .lock()
+            .expect("peers lock")
+            .get(id)
+            .is_some_and(|handles| !handles.is_empty())
+    }
+
+    /// Remembered dial address for a peer we initiated a connection to.
+    fn dial_target(&self, id: &EndpointId) -> Option<(EndpointAddr, VirtualAddrs)> {
+        self.dial_targets
+            .lock()
+            .expect("dial targets lock")
+            .get(id)
+            .cloned()
+    }
+
+    /// Ask the reconnect worker to redial a peer whose link just dropped.
+    ///
+    /// No-ops for peers we never dialed (the accept side), for peers that are
+    /// already being retried, and when the request queue is full. The
+    /// `reconnecting` mark is cleared by the worker when it gives up or
+    /// reconnects, so a later drop can schedule a fresh attempt.
+    fn schedule_reconnect(&self, remote: &EndpointId) {
+        let Some((addr, desired)) = self.dial_target(remote) else {
+            // We are the responder: the remote owns this link and will redial.
+            tracing::debug!(peer = %remote.fmt_short(), "peer down, not a dial target");
+            return;
+        };
+        if !self
+            .reconnecting
+            .lock()
+            .expect("reconnecting lock")
+            .insert(*remote)
+        {
+            tracing::debug!(peer = %remote.fmt_short(), "reconnect already scheduled");
+            return;
+        }
+        if let Err(err) = self.reconnect_tx.try_send((addr, desired)) {
+            self.reconnecting
+                .lock()
+                .expect("reconnecting lock")
+                .remove(remote);
+            tracing::warn!(peer = %remote.fmt_short(), "reconnect queue rejected: {err}");
+        }
+    }
 }
 
 /// Router protocol handler (responder side of every connection).
@@ -231,9 +299,9 @@ impl ProtocolHandler for Handler {
         let _ = self.shared.event_tx.send(MeshEvent::PeerUp(remote));
 
         // Serve control requests on additional bi-streams until closed.
+        // Deregistration and the `PeerDown` event are emitted by the
+        // connection's `close_watcher`, which owns cleanup for both roles.
         ctrl_loop(&self.shared, &conn).await;
-        self.shared.remove_handle(&remote, conn.stable_id());
-        let _ = self.shared.event_tx.send(MeshEvent::PeerDown(remote));
         Ok(())
     }
 }
@@ -460,10 +528,109 @@ fn register_conn(shared: &Arc<Shared>, conn: Connection) {
     tracing::debug!(peer = %remote.fmt_short(), "peer connected");
 }
 
+/// Single owner of connection teardown: drop the handle, tell the node, and —
+/// if we were the dialer — start redialing. Without the redial a dropped QUIC
+/// link stayed dead forever: the remote cannot reach us either (it has no
+/// address lookup for a bare peer id in isolated networks), so a 3-node relay
+/// topology lost its middle hop permanently after a netem-induced timeout.
 async fn close_watcher(shared: Arc<Shared>, handle: Arc<PeerHandle>, remote: EndpointId) {
     let _ = handle.conn.closed().await;
     shared.remove_handle(&remote, handle.stable_id);
     tracing::debug!(peer = %remote.fmt_short(), "peer disconnected");
+    let _ = shared.event_tx.send(MeshEvent::PeerDown(remote));
+    shared.schedule_reconnect(&remote);
+}
+
+/// Reconnect dispatcher: one retry task per dropped peer, so an unreachable
+/// peer's 30s backoff never delays the others' redials.
+async fn reconnect_worker(
+    shared: Arc<Shared>,
+    mut rx: mpsc::Receiver<(EndpointAddr, VirtualAddrs)>,
+) {
+    while let Some((addr, desired)) = rx.recv().await {
+        tokio::spawn(reconnect_peer(shared.clone(), addr, desired));
+    }
+}
+
+/// Redial one peer with exponential backoff until it is reachable again.
+///
+/// Exits as soon as *any* connection to the peer is registered (the topology
+/// dialer or the remote itself may have restored the link first) and always
+/// clears the `reconnecting` mark so a later drop can schedule a fresh round.
+async fn reconnect_peer(shared: Arc<Shared>, addr: EndpointAddr, desired: VirtualAddrs) {
+    let remote = addr.id;
+    let mut backoff = RECONNECT_MIN_BACKOFF;
+    loop {
+        if shared.has_peer(&remote) {
+            tracing::debug!(peer = %remote.fmt_short(), "reconnect unnecessary, peer is up");
+            break;
+        }
+        // Prefer the freshest target: a successful dial in the meantime may
+        // have replaced the address set (relay migration, new direct addrs).
+        let (target, wants) = shared
+            .dial_target(&remote)
+            .unwrap_or_else(|| (addr.clone(), desired));
+        match connect_peer(&shared, target, wants).await {
+            Ok((_, assigned)) => {
+                // The TAP is already configured with the addresses we hold; a
+                // different grant (creator rebuilt its lease table) would leave
+                // the overlay half-broken, so make it visible.
+                let mine = *shared.my_addrs.read().expect("my_addrs lock");
+                if !assigned.is_empty() && assigned != mine {
+                    tracing::warn!(
+                        peer = %remote.fmt_short(),
+                        assigned = %assigned.display(),
+                        local = %mine.display(),
+                        "reconnect got a different address assignment; keeping the local one"
+                    );
+                }
+                tracing::info!(peer = %remote.fmt_short(), "mesh link restored after drop");
+                break;
+            }
+            Err(err) => {
+                tracing::debug!(
+                    peer = %remote.fmt_short(),
+                    retry_in_s = backoff.as_secs(),
+                    "reconnect failed: {err:#}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+            }
+        }
+    }
+    shared
+        .reconnecting
+        .lock()
+        .expect("reconnecting lock")
+        .remove(&remote);
+}
+
+/// Dial, authenticate and attach one peer, then serve its control streams.
+///
+/// Shared by [`Mesh::dial`] and the reconnect worker. Teardown (deregistration
+/// plus the `PeerDown` event) belongs to [`close_watcher`], so neither caller
+/// emits a duplicate event when the connection later closes.
+async fn connect_peer(
+    shared: &Arc<Shared>,
+    addr: EndpointAddr,
+    desired: VirtualAddrs,
+) -> anyhow::Result<(MemberRecord, VirtualAddrs)> {
+    let remote = addr.id;
+    let conn = shared
+        .endpoint
+        .connect(addr, crate::proto::ALPN)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
+    let (record, assigned_addrs) = auth_initiator(shared, &conn, desired).await?;
+    register_conn(shared, conn.clone());
+    shared.membership.upsert(record.clone());
+    let _ = shared.event_tx.send(MeshEvent::PeerUp(remote));
+
+    // The initiator side also serves control requests from the remote.
+    let shared = shared.clone();
+    tokio::spawn(async move { ctrl_loop(&shared, &conn).await });
+
+    Ok((record, assigned_addrs))
 }
 
 async fn outbound_pump(handle: Arc<PeerHandle>, mut out_rx: mpsc::Receiver<OutMsg>) {
@@ -637,6 +804,7 @@ impl Mesh {
         let (frame_tx, frame_rx) = mpsc::channel(1024);
         let (flood_tx, flood_rx) = mpsc::channel(1024);
         let (event_tx, events) = broadcast::channel(EVENT_CAP);
+        let (reconnect_tx, reconnect_rx) = mpsc::channel(RECONNECT_QUEUE_CAP);
 
         let my_id = cfg.endpoint.id();
         let shared = Arc::new(Shared {
@@ -649,12 +817,18 @@ impl Mesh {
             allocator: cfg.allocator.map(tokio::sync::Mutex::new),
             membership: cfg.membership,
             peers: Mutex::new(HashMap::new()),
+            dial_targets: Mutex::new(HashMap::new()),
+            reconnecting: Mutex::new(HashSet::new()),
+            reconnect_tx,
             link_samples: Mutex::new(HashMap::new()),
             bans: Mutex::new(HashMap::new()),
             frame_tx,
             flood_tx,
             event_tx,
         });
+
+        // Redial worker for links we initiated; survives every peer churn.
+        tokio::spawn(reconnect_worker(shared.clone(), reconnect_rx));
 
         let mut router_builder = Router::builder(cfg.endpoint.clone()).accept(
             crate::proto::ALPN,
@@ -699,12 +873,7 @@ impl Mesh {
 
     /// Whether we hold at least one live connection to `id`.
     pub fn is_connected(&self, id: &EndpointId) -> bool {
-        self.shared
-            .peers
-            .lock()
-            .expect("peers lock")
-            .get(id)
-            .is_some_and(|h| !h.is_empty())
+        self.shared.has_peer(id)
     }
 
     pub fn connected_peers(&self) -> Vec<EndpointId> {
@@ -817,24 +986,14 @@ impl Mesh {
                 assigned_addrs: VirtualAddrs::default(),
             });
         }
-        let conn = self
-            .shared
-            .endpoint
-            .connect(addr, crate::proto::ALPN)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
-        let (record, assigned_addrs) = auth_initiator(&self.shared, &conn, desired).await?;
-        register_conn(&self.shared, conn.clone());
-        self.shared.membership.upsert(record.clone());
-        let _ = self.shared.event_tx.send(MeshEvent::PeerUp(remote));
-
-        // The initiator side also serves control requests from the remote.
-        let shared = self.shared.clone();
-        tokio::spawn(async move {
-            ctrl_loop(&shared, &conn).await;
-            shared.remove_handle(&remote, conn.stable_id());
-            let _ = shared.event_tx.send(MeshEvent::PeerDown(remote));
-        });
+        // The connect call consumes the address, but we must keep it: a drop
+        // (netem timeout, path failure) can only be repaired by the dialer.
+        let (record, assigned_addrs) = connect_peer(&self.shared, addr.clone(), desired).await?;
+        self.shared
+            .dial_targets
+            .lock()
+            .expect("dial targets lock")
+            .insert(remote, (addr, desired));
 
         Ok(DialOutcome {
             remote: record,
