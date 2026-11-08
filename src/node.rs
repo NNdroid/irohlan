@@ -382,7 +382,16 @@ pub async fn run_node(
                                 // peers again they keep an expired entry and
                                 // unicast to us is dropped. Announce right away so
                                 // the MAC table converges with the link.
-                                bus.publish(BusMsg::Announce(mesh.my_record())).await;
+                                //
+                                // Skip it while our own addresses are still
+                                // empty: the join handshake raises PeerUp before
+                                // the allocator reply is applied, and publishing
+                                // then would put an address-less record into every
+                                // peer's member table.
+                                let record = mesh.my_record();
+                                if !record.addrs.is_empty() {
+                                    bus.publish(BusMsg::Announce(record)).await;
+                                }
                             }
                             crate::mesh::MeshEvent::PeerDown(id) => {
                                 tracing::debug!(peer = %id.fmt_short(), "mesh event: peer down");
