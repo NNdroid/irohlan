@@ -30,6 +30,11 @@ PROFILE_ORDER = [
     "mobile",
 ]
 MODE_ORDER = ["direct", "relay"]
+# `clean` injects no impairment, so a failed iperf3/ping there is a harness or
+# product regression. Under netem, lost measurements ARE the result we are
+# trying to measure (an 8% loss + 8mbit mobile link is allowed to starve the
+# iperf3 control channel or NDP); those go into warnings, not the CI gate.
+BASELINE_PROFILES = frozenset({"clean"})
 
 RTT_RE = re.compile(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms")
 LOSS_RE = re.compile(r"([\d.]+)%\s*packet loss")
@@ -227,7 +232,13 @@ def analyze(root):
                 )
     for r in rows:
         for err in r["errors"]:
-            warnings.append(f"{r['mode']}/{r['profile']}: {err}")
+            if r["profile"] in BASELINE_PROFILES:
+                warnings.append(f"[FATAL] {r['mode']}/{r['profile']}: {err}")
+            else:
+                warnings.append(
+                    f"{r['mode']}/{r['profile']} (impaired profile, "
+                    f"measurement lost): {err}"
+                )
 
     metrics_failures = 0
     for p in root.rglob("metrics-errors.txt"):
@@ -322,6 +333,12 @@ def markdown(data):
         lines.append("- All measured profiles completed without errors.")
     lines.append("")
     lines.append(
+        "> Only the `clean` baseline must complete without errors. Failures on "
+        "`netem` profiles are measured degradation (warnings), not CI failures; "
+        "a missing mode is always fatal."
+    )
+    lines.append("")
+    lines.append(
         "> `relayed`, `limited` and `CoDel` are per-profile deltas summed over "
         "all nodes. In `direct` mode there is no relay hop, so they stay at 0 "
         "by design. `flows` is the instantaneous active-flow count at the end "
@@ -337,7 +354,10 @@ def main():
     ap.add_argument(
         "--fail-on-error",
         action="store_true",
-        help="exit 1 when a measurement errored or a mode never became ready",
+        help=(
+            "exit 1 when a mode never became ready, no rows exist, or a "
+            "clean (unimpaired) baseline measurement errored"
+        ),
     )
     args = ap.parse_args()
     root = Path(args.root)
@@ -350,9 +370,11 @@ def main():
     else:
         json.dump(data, sys.stdout, indent=2, sort_keys=False)
         sys.stdout.write("\n")
-    if args.fail_on_error and (
-        data["failed_modes"] or any(r["errors"] for r in data["rows"])
-    ):
+    baseline_errors = [
+        r for r in data["rows"] if r["errors"] and r["profile"] in BASELINE_PROFILES
+    ]
+    fatal = bool(data["failed_modes"]) or not data["rows"] or baseline_errors
+    if args.fail_on_error and fatal:
         return 1
     return 0
 

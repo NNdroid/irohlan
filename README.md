@@ -353,8 +353,11 @@ IPv6)、v5 链路质量与路径代价、relay 累计差值、active flows / que
 节点的回环 `/metrics` 拉一次指标。输出 `summary.md` / `summary.json` 与逐档原始
 文件。`ΔTCP` 是相对同拓扑 `clean` 的**吞吐下降百分比**,越大越差;`relay` /
 `limited` / `CoDel` 是该档内所有节点累计差值之和。报告会自动给出告警(例如
-relay 模式完全没有中继帧、开了限速却没有 CoDel 丢帧、IPv6 ping 全失败),
-`report.py --fail-on-error` 可在测量出错或拓扑没就绪时返回非零。
+relay 模式完全没有中继帧、开了限速却没有 CoDel 丢帧、IPv6 ping 全失败)。
+`report.py --fail-on-error` 只在「拓扑没就绪 / 一行结果都没有 / **没有注入损伤的
+`clean` 基线**测量失败」时返回非零:netem 档位本来就是要制造损伤,iperf3
+控制通道被拖死、NDP 超时、ping 100% 丢包都是**测出来的结果**,记成告警而不是
+CI 失败,否则弱网矩阵必然报红。
 
 [`benchmark.yml`](.github/workflows/benchmark.yml) 只提供 `workflow_dispatch`
 手动触发(可改档位/时长/限速),**没有定时任务**,需要时在 Actions 里点
@@ -365,6 +368,20 @@ summary。它也**不作为 PR 门槛**,因为共享 runner 的绝对吞吐不�
 ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mode>/` 并一并上传;
 `Assert measurements completed` 会打印 `summary.json`,失败时另一步会把
 `errors.txt` / `*.err`、节点日志关键行和报告告警直接打进 CI 日志。
+
+完整矩阵(`profiles=all` + `--ipv6`,18 行)跑下来的观察:
+- 双栈是通的:16/18 档 `ping6_ms` 有值,IPv4/IPv6 的 RTT 在
+  `latency`(≈120 ms) / `jitter`(≈84 ms) / `congested` / `reorder` 下几乎一致,
+  说明 NDP 与 IPv6 转发和 IPv4 走同一条 TAP + QUIC 路径,没有额外惩罚。
+- `mobile`(`delay 80ms 30ms loss 3% rate 8mbit duplicate 0.5%`)是最狠的一档:
+  direct 下 IPv4 ping ≈178 ms、IPv6 探测因 NDP 在 4 秒窗口内没解析出来而全丢;
+  relay 下叠加两跳 netem + 2048 KiB/s 中继上限,成员公告被饿死、ARP 变成
+  `Destination Host Unreachable`,该档测量大面积缺失 —— **这是弱网结果,不是
+  harness 故障**。已据此把 iperf3 客户端宽限期从 `duration+30` 提到
+  `duration+45`(实测 `relay/mobile` 的 TCP 流跑到 32.9 s 仍没完成 `-t 5` 的
+  收尾握手就被旧超时砍掉),控制通道瞬时失败会换一台新 server 重试一次,
+  IPv6 探测 `-W 5` 并重试一次。
+- `clean` 基线仍要求零错误;`failed_modes` 与空报告始终致命。
 
 > 这是单机仿真:netem 劣化的是 veth 上的 QUIC underlay,不模拟公网 NAT、公共
 > relay 或 CDN 路径;`--ipv6` 目前只加 IPv6 ping 探针,iperf3 仍走 IPv4。
@@ -461,6 +478,10 @@ ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mo
   地址发现的隔离网络里 gossip 拨号会持续超时,成员公告随之丢失,60 秒 TTL
   过期后即使 QUIC 连接仍在,`by_mac()` 也会查不到对端、单播被丢弃。这种环境
   请显式用 `--bus flood`(见 Benchmark 章节)
+- 即便用 flood,**极端弱网 + 多跳中继**也会让 20 秒一次的成员公告被饿死:
+  `mobile` 档(每跳 80ms±30ms / 3% 丢包 / 8mbit)叠加 2048 KiB/s 中继上限时,
+  60 秒 TTL 过后 ARP 直接报 `Destination Host Unreachable`。缩小成员公告间隔或
+  提高 TTL 可缓解,但会牺牲收敛开销;目前把它如实记进 benchmark 报告
 - 目前仅支持 Linux;Windows(需 tap-windows6 驱动)在路线图上
 - 一个主机同时只属于一个虚拟网络
 - 链路质量全部来自 QUIC 选中路径的统计,不是主动探测:RTT 是 QUIC 的平滑估计,

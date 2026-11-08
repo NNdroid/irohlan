@@ -49,6 +49,11 @@ BENCH_SETTLE_SECS="${BENCH_SETTLE_SECS:-6}"
 # no server-side timeout at all. Without this ceiling the harness would hang
 # in `wait` until the CI job timeout.
 BENCH_IPERF_SERVER_SECS="${BENCH_IPERF_SERVER_SECS:-90}"
+# Grace period on top of `-t duration` for the iperf3 client. On a heavily
+# impaired underlay (e.g. `mobile`: 80ms+/-30ms delay, 3% loss, 8mbit on
+# every veth endpoint) the test-start/stop control exchange can take many
+# seconds; too small a value makes `timeout` kill a test that was working.
+BENCH_IPERF_CLIENT_EXTRA="${BENCH_IPERF_CLIENT_EXTRA:-45}"
 
 BENCH_NODES=()
 BENCH_VETH_DEVS=()
@@ -532,33 +537,58 @@ bench_stop_iperf_server() {
     rm -f "$pidfile.pid"
 }
 
+# One iperf3 measurement against a fresh `--one-off` server. An impaired
+# underlay can kill the control channel before the test even starts, so a
+# single transient failure is retried once with a brand-new server.
+# $1 = output prefix, $2 = client netns, $3 = timeout seconds, $4.. = args
+bench_iperf_probe() {
+    local prefix=$1 ns=$2 limit=$3
+    shift 3
+    local attempt rc
+    for attempt in 1 2; do
+        bench_run_iperf_server "$prefix-server"
+        rc=0
+        ip netns exec "$ns" timeout -k 5 "$limit" iperf3 "$@" \
+            >"$prefix.json" 2>"$prefix.err" || rc=$?
+        bench_stop_iperf_server "$prefix-server"
+        if ((rc == 0)); then
+            return 0
+        fi
+        # 124/137 means `timeout` fired. Retrying would only double the
+        # deadline on an already-unresponsive link; report the loss instead.
+        if ((rc == 124 || rc == 137)); then
+            bench_log "$(basename "$prefix") iperf3 hit its ${limit}s deadline; not retrying"
+            return 1
+        fi
+        if ((attempt == 1)); then
+            bench_log "$(basename "$prefix") iperf3 failed once, retrying with a fresh server"
+            sleep 1
+        fi
+    done
+    return 1
+}
+
 bench_measure() {
     local out=$1 duration=$2 parallel=$3 udp_rate=$4 relay_limit=$5
-    local server ip_a ip_s
+    local server ip_a ip_s ns_a client_timeout
     server=$(bench_server_node)
     ip_s=$(vip_of "$server")
     ip_a=$(vip_of a)
-    local ns_a
     ns_a=$(ns_of a)
+    client_timeout=$((duration + BENCH_IPERF_CLIENT_EXTRA))
     mkdir -p "$out"
 
     # TCP goodput + retransmits.
-    bench_run_iperf_server "$out/tcp-server"
-    if ! ip netns exec "$ns_a" timeout -k 5 "$((duration + 30))" iperf3 \
-        -c "$ip_s" -B "$ip_a" -t "$duration" -P "$parallel" -J \
-        >"$out/tcp.json" 2>"$out/tcp.err"; then
+    if ! bench_iperf_probe "$out/tcp" "$ns_a" "$client_timeout" \
+        -c "$ip_s" -B "$ip_a" -t "$duration" -P "$parallel" -J; then
         echo "tcp iperf3 failed" >>"$out/errors.txt"
     fi
-    bench_stop_iperf_server "$out/tcp-server"
 
     # UDP goodput, loss and jitter.
-    bench_run_iperf_server "$out/udp-server"
-    if ! ip netns exec "$ns_a" timeout -k 5 "$((duration + 30))" iperf3 \
-        -c "$ip_s" -B "$ip_a" -u -b "$udp_rate" -t "$duration" -J \
-        >"$out/udp.json" 2>"$out/udp.err"; then
+    if ! bench_iperf_probe "$out/udp" "$ns_a" "$client_timeout" \
+        -c "$ip_s" -B "$ip_a" -u -b "$udp_rate" -t "$duration" -J; then
         echo "udp iperf3 failed" >>"$out/errors.txt"
     fi
-    bench_stop_iperf_server "$out/udp-server"
 
     # Idle overlay RTT (through the real TAP path).
     if ! ip netns exec "$ns_a" ping -c "$BENCH_PING_COUNT" -i 0.2 -W 2 "$ip_s" \
@@ -567,11 +597,17 @@ bench_measure() {
     fi
 
     # Dual-stack data plane: NDP + IPv6 forwarding across the same QUIC
-    # underlay, so netem affects it exactly like the IPv4 probes.
+    # underlay, so netem affects it exactly like the IPv4 probes. NDP needs a
+    # longer reply window on impaired links; retry once so a slow neighbour
+    # discovery is not recorded as a broken IPv6 data plane.
     if [[ "$BENCH_IPV6" == "1" && -n "$BENCH_SERVER_IP6" ]]; then
-        if ! ip netns exec "$ns_a" ping -6 -c "$BENCH_PING_COUNT" -i 0.2 -W 2 \
+        if ! ip netns exec "$ns_a" ping -6 -c "$BENCH_PING_COUNT" -i 0.2 -W 5 \
             "$BENCH_SERVER_IP6" >"$out/ping6.txt" 2>&1; then
-            echo "ping -6 failed" >>"$out/errors.txt"
+            sleep 1
+            if ! ip netns exec "$ns_a" ping -6 -c "$BENCH_PING_COUNT" -i 0.2 -W 5 \
+                "$BENCH_SERVER_IP6" >"$out/ping6.txt" 2>&1; then
+                echo "ping -6 failed" >>"$out/errors.txt"
+            fi
         fi
     fi
 
@@ -579,7 +615,7 @@ bench_measure() {
     # only meaningful when a relay node is actually rate-limiting forwarding.
     if [[ "$BENCH_MODE" == relay && "$relay_limit" -gt 0 ]]; then
         bench_run_iperf_server "$out/elephant-server"
-        ip netns exec "$ns_a" timeout -k 5 "$((duration + 20))" iperf3 \
+        ip netns exec "$ns_a" timeout -k 5 "$client_timeout" iperf3 \
             -c "$ip_s" -B "$ip_a" -t "$duration" -P 4 -J \
             >"$out/elephant.json" 2>"$out/elephant.err" &
         local elephant=$!
@@ -588,7 +624,7 @@ bench_measure() {
             >"$out/ping-under-load.txt" 2>&1; then
             echo "ping-under-load failed" >>"$out/errors.txt"
         fi
-        bench_wait_bounded "$elephant" "$((duration + 30))" || true
+        bench_wait_bounded "$elephant" "$client_timeout" || true
         bench_stop_iperf_server "$out/elephant-server"
     fi
 }

@@ -47,7 +47,7 @@ underlay, not on the emulated TAP frames. The harness always uses the flood
 broadcast bus: gossip needs address lookup that an isolated netns cannot
 provide. Environment overrides: BENCH_ROOT, BENCH_MTU, BENCH_READY_TIMEOUT,
 BENCH_READY_STREAK, BENCH_PROBE_TIMEOUT, BENCH_PING_COUNT,
-BENCH_IPERF_SERVER_SECS.
+BENCH_IPERF_SERVER_SECS, BENCH_IPERF_CLIENT_EXTRA.
 EOF
 }
 
