@@ -231,9 +231,16 @@ bench_start_nodes() {
 
     # --no-relay is mandatory for the linear topology: a public relay would
     # let a and c connect directly and bypass the middle node entirely.
-    # --no-mdns keeps discovery deterministic: the ticket's direct addresses
-    # are the only way peers find the creator on these point-to-point veths.
-    local common=(--no-relay --no-mdns --mtu "$BENCH_MTU" --secret "$BENCH_SECRET"
+    #
+    # mDNS MUST stay enabled. The join ticket only carries the creator's
+    # direct addresses, so every other peer connection (mesh reconnects and
+    # gossip dials) has to resolve a bare EndpointId via address lookup.
+    # presets::N0DisableRelay still installs pkarr/DNS lookups, but those
+    # cannot reach dns.iroh.link from an isolated netns (no DNS, no default
+    # route). mDNS over the veth link is the ONLY usable lookup here.
+    # iroh merges lookup services concurrently (AddressLookupStream), so the
+    # timing-out DNS lookups do not block successful mDNS results.
+    local common=(--no-relay --mtu "$BENCH_MTU" --secret "$BENCH_SECRET"
         --relay-limit-kib "$relay_limit"
         --metrics-addr "127.0.0.1:$BENCH_METRICS_PORT")
     if [[ "$BENCH_MODE" == relay ]]; then
@@ -308,22 +315,51 @@ PY
     return 1
 }
 
+# Dump enough state to explain WHY the overlay never came up. The full node
+# logs only live in $BENCH_LOG_ROOT, which the runner deletes on exit, so the
+# harness also copies them into the results tree (see bench_collect_failure).
+bench_dump_diagnostics() {
+    local server=$1 ip=$2 status=$3 node ns
+    bench_log "status file: $status ($([[ -f "$status" ]] && echo present || echo MISSING))"
+    for node in "${BENCH_NODES[@]}"; do
+        ns=$(ns_of "$node")
+        bench_log "--- $node: interfaces / addresses ---"
+        ip netns exec "$ns" ip -brief addr show 2>&1 | sed 's/^/[bench]   /' >&2 || true
+        bench_log "--- $node: multicast groups ---"
+        ip netns exec "$ns" ip maddr show 2>&1 | sed 's/^/[bench]   /' >&2 || true
+        bench_log "--- $node: node log tail ---"
+        tail -n 40 "$BENCH_LOG_ROOT/$node.log" >&2 || true
+    done
+    bench_log "--- final ping attempt (a -> $ip) ---"
+    ip netns exec "$(ns_of a)" ping -c 3 -W 2 "$ip" 2>&1 | tail -n 10 >&2 || true
+}
+
+bench_collect_failure() {
+    local out=$1 node
+    mkdir -p "$out"
+    for node in "${BENCH_NODES[@]}"; do
+        cp "$BENCH_LOG_ROOT/$node.log" "$out/log-$node.txt" 2>/dev/null || true
+        cp "$(state_of "$node")/status.json" "$out/status-$node.json" 2>/dev/null || true
+        cp "$(state_of "$node")/network.json" "$out/network-$node.json" 2>/dev/null || true
+    done
+}
+
 bench_wait_ready() {
     local server ip status i
     server=$(bench_server_node)
     ip=$(vip_of "$server")
     status="$(state_of "$server")/status.json"
     for ((i = 0; i < BENCH_READY_TIMEOUT; i++)); do
-        if [[ -f "$status" ]] && ip netns exec "$(ns_of a)" ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+        # Readiness is a data-plane property: one successful ping is enough.
+        # Do NOT gate it on status.json existing -- a wrong state path would
+        # otherwise look exactly like a broken overlay for the whole timeout.
+        if ip netns exec "$(ns_of a)" ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
             bench_log "overlay ready after ${i}s (a -> $server @ $ip)"
             break
         fi
         if ((i == BENCH_READY_TIMEOUT - 1)); then
-            bench_log "overlay did NOT become ready; node logs:"
-            local node
-            for node in "${BENCH_NODES[@]}"; do
-                tail -n 15 "$BENCH_LOG_ROOT/$node.log" >&2 || true
-            done
+            bench_log "overlay did NOT become ready after ${BENCH_READY_TIMEOUT} polls"
+            bench_dump_diagnostics "$server" "$ip" "$status"
             return 1
         fi
         sleep 1

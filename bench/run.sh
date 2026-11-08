@@ -108,6 +108,9 @@ for mode in "${MODES[@]}"; do
     if ! bench_wait_ready; then
         bench_log "SKIPPING mode '$mode': overlay never became ready"
         FAILED_MODES+=("$mode")
+        # Node logs live under /tmp and disappear with the runner; copy them
+        # into the results tree so the artifact can explain the failure.
+        bench_collect_failure "$BENCH_OUT/_diagnostics/$mode"
         continue
     fi
 

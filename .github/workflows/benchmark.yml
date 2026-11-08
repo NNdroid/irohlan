@@ -122,7 +122,12 @@ jobs:
           fi
 
       - name: Assert measurements completed
-        run: python3 bench/report.py --root bench-results --fail-on-error >/dev/null
+        run: |
+          if ! python3 bench/report.py --root bench-results --fail-on-error >/dev/null; then
+            echo "::error::benchmark reported failed modes or measurement errors"
+            cat bench-results/summary.json 2>/dev/null || true
+            exit 1
+          fi
 
       - name: Publish job summary
         if: always()
@@ -160,5 +165,8 @@ jobs:
             bench-results/**/ledger-*.json
             bench-results/**/log-*.txt
             bench-results/**/errors.txt
+            bench-results/_diagnostics/**/log-*.txt
+            bench-results/_diagnostics/**/status-*.json
+            bench-results/_diagnostics/**/network-*.json
           if-no-files-found: warn
           retention-days: 30
