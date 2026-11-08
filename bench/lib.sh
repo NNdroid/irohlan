@@ -14,6 +14,13 @@
 #
 # All nodes share the host filesystem but get separate XDG_STATE_HOME dirs,
 # so `irohlan show` can read the creator ticket from the host namespace.
+#
+# The nodes MUST use the flood bus, not gossip. Gossip dials bare EndpointIds,
+# which needs a working address lookup; an isolated netns has no DNS, no
+# default route and no usable mDNS, so gossip broadcasts (ARP/NDP frames and
+# membership announcements) go missing and the member table expires. Flood
+# reuses the mesh connections that were already established from the ticket's
+# direct addresses, so it needs no address lookup at all.
 
 set -euo pipefail
 
@@ -28,6 +35,11 @@ BENCH_MTU="${BENCH_MTU:-1400}"
 BENCH_SECRET="irohlan-benchmark-only-secret"
 BENCH_METRICS_PORT=9090
 BENCH_READY_TIMEOUT="${BENCH_READY_TIMEOUT:-90}"
+# A single lucky echo reply is not enough: the first CI run had a working
+# overlay for one ping and then lost it. Require consecutive successes.
+BENCH_READY_STREAK="${BENCH_READY_STREAK:-3}"
+# Short per-profile liveness check, used before netem is (re)applied.
+BENCH_PROBE_TIMEOUT="${BENCH_PROBE_TIMEOUT:-10}"
 BENCH_PING_COUNT="${BENCH_PING_COUNT:-20}"
 # status.json is written every 5s; wait for one more tick before collecting
 # so the "after" snapshot includes the whole measurement window.
@@ -126,13 +138,25 @@ bench_list_profiles() {
     echo "clean latency jitter loss heavy-loss slow congested reorder mobile"
 }
 
-bench_apply_netem() {
-    local spec entry ns dev
-    spec=$(bench_netem_spec "$1")
-    for entry in "${BENCH_VETH_DEVS[@]}"; do
+# Remove any netem left over from the previous profile. Callers use this
+# before probing the overlay, otherwise a loss/reorder profile still in
+# place could make a healthy overlay look broken.
+bench_clear_netem() {
+    local entry ns dev
+    for entry in "${BENCH_VETH_DEVS[@]:-}"; do
         ns=${entry%%:*}
         dev=${entry##*:}
         ip netns exec "$ns" tc qdisc del dev "$dev" root 2>/dev/null || true
+    done
+}
+
+bench_apply_netem() {
+    local spec entry ns dev
+    spec=$(bench_netem_spec "$1")
+    bench_clear_netem
+    for entry in "${BENCH_VETH_DEVS[@]}"; do
+        ns=${entry%%:*}
+        dev=${entry##*:}
         if [[ -n "$spec" ]]; then
             # shellcheck disable=SC2086
             ip netns exec "$ns" tc qdisc add dev "$dev" root netem $spec
@@ -232,19 +256,28 @@ bench_start_nodes() {
     # --no-relay is mandatory for the linear topology: a public relay would
     # let a and c connect directly and bypass the middle node entirely.
     #
-    # mDNS MUST stay enabled. The join ticket only carries the creator's
-    # direct addresses, so every other peer connection (mesh reconnects and
-    # gossip dials) has to resolve a bare EndpointId via address lookup.
-    # presets::N0DisableRelay still installs pkarr/DNS lookups, but those
-    # cannot reach dns.iroh.link from an isolated netns (no DNS, no default
-    # route). mDNS over the veth link is the ONLY usable lookup here.
-    # iroh merges lookup services concurrently (AddressLookupStream), so the
-    # timing-out DNS lookups do not block successful mDNS results.
-    local common=(--no-relay --mtu "$BENCH_MTU" --secret "$BENCH_SECRET"
+    # --bus flood is equally mandatory. The join ticket only carries the
+    # creator's direct addresses; iroh-gossip would have to dial every other
+    # peer by bare EndpointId, which needs an address lookup. An isolated
+    # netns has no DNS/default route and mDNS cannot join a multicast group
+    # on a nonexistent default interface, so those dials time out. Gossip
+    # then drops ARP/NDP broadcasts and the 20s membership announcements,
+    # the 60s member TTL expires, and the L2 overlay goes dark even though
+    # the QUIC mesh is still connected. Flood sends envelopes over the
+    # already-established mesh links (with (origin, seq) dedup) and needs
+    # no lookup service at all.
+    #
+    # mDNS is left enabled but is NOT on the critical path: its send errors
+    # and the pkarr/DNS timeouts are expected noise in this topology.
+    local common=(--no-relay --bus flood --mtu "$BENCH_MTU"
+        --secret "$BENCH_SECRET"
         --relay-limit-kib "$relay_limit"
         --metrics-addr "127.0.0.1:$BENCH_METRICS_PORT")
     if [[ "$BENCH_MODE" == relay ]]; then
-        common+=(--topology partial --mesh-links 2)
+        # One link per node keeps the partial-mesh dialer idle: a and c each
+        # already have the creator, so no bare-EndpointId dial is attempted.
+        # Higher values would make a try (and fail) to dial c.
+        common+=(--topology partial --mesh-links 1)
     else
         common+=(--topology full)
     fi
@@ -325,6 +358,13 @@ bench_dump_diagnostics() {
         ns=$(ns_of "$node")
         bench_log "--- $node: interfaces / addresses ---"
         ip netns exec "$ns" ip -brief addr show 2>&1 | sed 's/^/[bench]   /' >&2 || true
+        bench_log "--- $node: link flags (is the TAP UP?) ---"
+        ip netns exec "$ns" ip -brief link show 2>&1 | sed 's/^/[bench]   /' >&2 || true
+        bench_log "--- $node: TAP counters (TX/RX frames) ---"
+        ip netns exec "$ns" ip -s link show "tap-$node" 2>&1 \
+            | sed 's/^/[bench]   /' >&2 || true
+        bench_log "--- $node: neighbours (ARP/NDP state) ---"
+        ip netns exec "$ns" ip neigh show 2>&1 | sed 's/^/[bench]   /' >&2 || true
         bench_log "--- $node: multicast groups ---"
         ip netns exec "$ns" ip maddr show 2>&1 | sed 's/^/[bench]   /' >&2 || true
         bench_log "--- $node: node log tail ---"
@@ -344,21 +384,33 @@ bench_collect_failure() {
     done
 }
 
+# One data-plane probe from a to the server's virtual address.
+bench_ping_once() {
+    ip netns exec "$(ns_of a)" ping -c 1 -W 2 "$1" >/dev/null 2>&1
+}
+
 bench_wait_ready() {
-    local server ip status i
+    local server ip status i streak=0
     server=$(bench_server_node)
     ip=$(vip_of "$server")
     status="$(state_of "$server")/status.json"
     for ((i = 0; i < BENCH_READY_TIMEOUT; i++)); do
-        # Readiness is a data-plane property: one successful ping is enough.
-        # Do NOT gate it on status.json existing -- a wrong state path would
-        # otherwise look exactly like a broken overlay for the whole timeout.
-        if ip netns exec "$(ns_of a)" ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
-            bench_log "overlay ready after ${i}s (a -> $server @ $ip)"
-            break
+        # Readiness is a data-plane property. Do NOT gate it on status.json
+        # existing -- a wrong state path would otherwise look exactly like a
+        # broken overlay for the whole timeout. A single echo reply is too
+        # weak (we have seen the overlay die right after one), so require a
+        # streak of consecutive replies.
+        if bench_ping_once "$ip"; then
+            streak=$((streak + 1))
+            if ((streak >= BENCH_READY_STREAK)); then
+                bench_log "overlay ready after ${i}s (a -> $server @ $ip, ${streak} consecutive pings)"
+                break
+            fi
+        else
+            streak=0
         fi
         if ((i == BENCH_READY_TIMEOUT - 1)); then
-            bench_log "overlay did NOT become ready after ${BENCH_READY_TIMEOUT} polls"
+            bench_log "overlay did NOT become ready after ${BENCH_READY_TIMEOUT} polls (streak=$streak/${BENCH_READY_STREAK})"
             bench_dump_diagnostics "$server" "$ip" "$status"
             return 1
         fi
@@ -375,6 +427,20 @@ bench_wait_ready() {
         fi
     fi
     return 0
+}
+
+# Cheap per-profile liveness check. The caller clears the previous profile's
+# qdisc first, so an intentional loss profile cannot cause a false negative.
+bench_check_overlay() {
+    local ip i
+    ip=$(vip_of "$(bench_server_node)")
+    for ((i = 0; i < BENCH_PROBE_TIMEOUT; i++)); do
+        if bench_ping_once "$ip"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------

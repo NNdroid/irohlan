@@ -89,9 +89,10 @@ arp -i tap0                  # IPv4 ARP 表项
 
 常用选项:`--no-ipv4` / `--no-ipv6` 切换单栈;`--subnet6` 自定义 IPv6 前缀
 (支持 /32~/96,主机位至少 32 位);`--no-relay` 禁用公共 relay(但 iroh 的
-`N0DisableRelay` 预设**仍会尝试 DNS/pkarr 地址发现**,完全无外网时要保留 mDNS
-才能同链路 peer 互发现);`--no-mdns` 关闭局域网 mDNS 发现;`--bus flood` 用泛洪
-代替 gossip(小网络排障用);`-v/-vv` 提升日志级别。
+`N0DisableRelay` 预设**仍会尝试 DNS/pkarr 地址发现**);完全无外网时,gossip
+总线仍需可用的 mDNS 才能按 EndpointId 拨号,而 `--bus flood` 只沿已建立的 mesh
+连接泛洪,可彻底不依赖地址发现(离线/隔离网络推荐);`--no-mdns` 关闭局域网
+mDNS 发现;`-v/-vv` 提升日志级别。
 启用 IPv6 时 MTU 必须 ≥ 1280(RFC 8200 的链路 MTU 下限),否则启动报错;
 默认 1500。纯 IPv4 网络可以用更小的 MTU。
 
@@ -265,12 +266,27 @@ relay 模式里 a 与 c **没有 IP 路由直连**,且所有节点带 `--no-rela
 必然经 b 转发,能真正压到按对端配额、flow 队列、DRR 与 CoDel。netem 施加在每个
 veth endpoint 的 egress qdisc 上,劣化的是 QUIC underlay 而不是 TAP 帧本身。
 
-⚠ **必须保留 mDNS(不要加 `--no-mdns`)**:join ticket 只携带创建者的直接地址,
-其余 peer 连接(mesh 重连、gossip 拨号)只能凭 EndpointId 做地址发现。隔离 netns
-里既没有 DNS 也没有默认路由,pkarr/DNS 查询必然超时,veth 链路上的 mDNS 是唯一
-能返回结果的 address lookup;iroh 并发合并多个 lookup,超时不会阻塞 mDNS 结果。
-若两边地址发现都不可用,ARP 广播送不到对端,`ping` 会一直不通,harness 判定
-「overlay 未就绪」并跳过该 mode(此前 CI 报红就是这个原因)。
+⚠ **harness 固定用 `--bus flood`,不要用默认的 gossip**:join ticket 只携带
+创建者的直接地址,而 gossip 要按裸 `EndpointId` 拨号,必须依赖地址发现。隔离
+netns 里没有 DNS、没有默认路由,mDNS 也因为「找不到默认接口」无法加入多播组
+(`could not join multicast group ... No such device`),所以 `gossip dial failed:
+timed out` 会反复出现。后果不是 QUIC 断链 —— `connected_peers`、`link_metrics`
+和 `routes` 都正常 —— 而是 **ARP/NDP 广播帧与 20 秒一次的成员公告送不出去**;
+成员 TTL(60 秒)一到就被清掉,`by_mac()` 找不到对端,`ping` 变成
+`Destination Host Unreachable`、`iperf3` 变成 `No route to host`。
+
+flood 把广播封装成 `(origin, seq)` 信封,直接沿**已经建立的 mesh 连接**泛洪,
+完全不需要地址发现;relay 拓扑另外用 `--mesh-links 1`,让 partial-mesh dialer
+不再尝试拨一个没有地址的 c。mDNS 保持开启但不在关键路径上,它和 pkarr/DNS
+的超时只是这个隔离环境里的预期日志噪声。
+
+> 排障顺序(CI 两次报红总结):第一次以为是 `--no-mdns` 的锅,打开 mDNS 后
+> 第二次复验依然失败;对比 `status.json` 里的 `frames_to_tap` 停滞、日志里的
+> `member expired` 与 `gossip dial failed` 才定位到总线,而不是地址发现。
+
+harness 还要求 overlay **连续 3 次 ping 成功**才算就绪(单次成功可能是刚建链时
+的偶然回包),并在每个弱网档位开始前先清掉上一档的 qdisc、再探一次活;overlay
+中途挂掉会立刻判该 mode 失败并落诊断,而不是把一堆空测量结果记成「弱网表现」。
 
 前置条件:root、`/dev/net/tun`、`iproute2`(`ip` + `tc`)、`iperf3`、
 `iputils-ping`、`python3`、`coreutils`。
@@ -320,9 +336,11 @@ relay 模式完全没有中继帧、开了限速却没有 CoDel 丢帧、IPv6 pi
 手动触发(可改档位/时长/限速),**没有定时任务**,需要时在 Actions 里点
 "Run workflow";产物是 `irohlan-benchmark-results` artifact,同时写进 job
 summary。它也**不作为 PR 门槛**,因为共享 runner 的绝对吞吐不可跨次比较,
-只看同一次运行内各档位之间的相对变化。若拓扑未就绪,harness 会把各节点的完整
-日志、接口/多播组状态与最后一次 ping 输出写到 `_diagnostics/<mode>/` 并一并上传,
-同时 `Assert measurements completed` 会把 `summary.json` 打进 CI 日志。
+只看同一次运行内各档位之间的相对变化。若拓扑未就绪或中途掉线,harness 会把
+各节点的完整日志、`status.json` / `network.json`,以及接口状态、TAP 收发计数、
+ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mode>/` 并一并上传;
+`Assert measurements completed` 会打印 `summary.json`,失败时另一步会把
+`errors.txt` / `*.err`、节点日志关键行和报告告警直接打进 CI 日志。
 
 > 这是单机仿真:netem 劣化的是 veth 上的 QUIC underlay,不模拟公网 NAT、公共
 > relay 或 CDN 路径;`--ipv6` 目前只加 IPv6 ping 探针,iperf3 仍走 IPv4。
@@ -415,7 +433,10 @@ summary。它也**不作为 PR 门槛**,因为共享 runner 的绝对吞吐不�
 - 加入网络时创建者必须在线(它是地址分配器,partial 模式下还作为锚点邻居)
 - partial mesh 的单播可能经过 1~2 跳中继,中继节点承担少量转发负载;
   链路状态收敛期间(秒级)个别帧可能被丢弃,由上层协议重试
-- 广播走 gossip 时消息不保证送达(ARP/NDP/TCP 自带重试,可容忍)
+- 广播走 gossip 时消息不保证送达(ARP/NDP/TCP 自带重试,可容忍);在完全没有
+  地址发现的隔离网络里 gossip 拨号会持续超时,成员公告随之丢失,60 秒 TTL
+  过期后即使 QUIC 连接仍在,`by_mac()` 也会查不到对端、单播被丢弃。这种环境
+  请显式用 `--bus flood`(见 Benchmark 章节)
 - 目前仅支持 Linux;Windows(需 tap-windows6 驱动)在路线图上
 - 一个主机同时只属于一个虚拟网络
 - 链路质量全部来自 QUIC 选中路径的统计,不是主动探测:RTT 是 QUIC 的平滑估计,

@@ -43,8 +43,10 @@ Usage: sudo ./bench/run.sh --binary PATH [options]
   -h, --help             show this help
 
 Profiles are applied with `tc netem` on every veth hop, i.e. on the QUIC
-underlay, not on the emulated TAP frames. Environment overrides:
-BENCH_ROOT, BENCH_MTU, BENCH_READY_TIMEOUT, BENCH_PING_COUNT.
+underlay, not on the emulated TAP frames. The harness always uses the flood
+broadcast bus: gossip needs address lookup that an isolated netns cannot
+provide. Environment overrides: BENCH_ROOT, BENCH_MTU, BENCH_READY_TIMEOUT,
+BENCH_READY_STREAK, BENCH_PROBE_TIMEOUT, BENCH_PING_COUNT.
 EOF
 }
 
@@ -118,6 +120,19 @@ for mode in "${MODES[@]}"; do
         local_out="$BENCH_OUT/$mode/$profile"
         mkdir -p "$local_out"
         bench_log "--- $mode / $profile ---"
+        # Check on a clean underlay: a broken overlay must not be reported
+        # as "weak network" measurements. Fail the mode early and keep the
+        # diagnostics instead of collecting a screen full of empty rows.
+        bench_clear_netem
+        if ! bench_check_overlay; then
+            bench_log "overlay stopped working before $mode/$profile"
+            bench_dump_diagnostics "$(bench_server_node)" \
+                "$(vip_of "$(bench_server_node)")" \
+                "$(state_of "$(bench_server_node)")/status.json"
+            bench_collect_failure "$BENCH_OUT/_diagnostics/$mode"
+            FAILED_MODES+=("$mode")
+            break
+        fi
         bench_apply_netem "$profile"
         # Give QUIC's RTT estimator, the congestion controller and the LSA
         # smoother a moment to react to the new netem profile.

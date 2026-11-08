@@ -129,6 +129,43 @@ jobs:
             exit 1
           fi
 
+      - name: Dump overlay diagnostics on failure
+        if: failure()
+        run: |
+          [[ -d bench-results ]] || { echo "no bench-results directory"; exit 0; }
+          echo "### failed modes"
+          cat bench-results/failed-modes.json 2>/dev/null || true
+          echo "### measurement errors"
+          for f in $(find bench-results -name errors.txt -o -name '*.err' | sort); do
+            if [[ -s "$f" ]]; then
+              echo "--- $f"
+              head -n 30 "$f"
+            fi
+          done
+          echo "### node log tails (failures only)"
+          if [[ -d bench-results/_diagnostics ]]; then
+          for f in $(find bench-results/_diagnostics -name 'log-*.txt' 2>/dev/null | sort); do
+            echo "--- $f"
+            # mDNS / pkarr timeouts are expected noise in an isolated netns
+            # and would otherwise crowd out the useful lines.
+            grep -aE "member |gossip|dial |TAP |ERROR|error" "$f" \
+              | grep -avE "error sending mDNS|pkarr_publish|pkarr_resolve|dns.iroh.link" \
+              | tail -n 25 || true
+          done
+          fi
+          echo "### report warnings"
+          python3 - <<'PY'
+          import json
+          try:
+              with open("bench-results/summary.json", encoding="utf-8") as f:
+                  data = json.load(f)
+          except Exception as e:
+              print(f"summary.json unavailable: {e}")
+          else:
+              for w in data.get("warnings", []):
+                  print("-", w)
+          PY
+
       - name: Publish job summary
         if: always()
         run: |
@@ -154,9 +191,13 @@ jobs:
           path: |
             bench-results/summary.json
             bench-results/summary.md
+            bench-results/failed-modes.json
             bench-results/**/meta.json
             bench-results/**/tcp.json
             bench-results/**/udp.json
+            bench-results/**/elephant.json
+            bench-results/**/*-server.json
+            bench-results/**/*.err
             bench-results/**/ping*.txt
             bench-results/**/status-*.json
             bench-results/**/before-*.json
@@ -165,6 +206,7 @@ jobs:
             bench-results/**/ledger-*.json
             bench-results/**/log-*.txt
             bench-results/**/errors.txt
+            bench-results/**/metrics-errors.txt
             bench-results/_diagnostics/**/log-*.txt
             bench-results/_diagnostics/**/status-*.json
             bench-results/_diagnostics/**/network-*.json
