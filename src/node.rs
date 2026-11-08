@@ -376,6 +376,13 @@ pub async fn run_node(
                         Ok(ev) => match ev {
                             crate::mesh::MeshEvent::PeerUp(id) => {
                                 tracing::debug!(peer = %id.fmt_short(), "mesh event: peer up");
+                                // A link that just came back (usually a redial
+                                // after a timeout) must not wait for the 20s
+                                // announcement tick: until our record reaches the
+                                // peers again they keep an expired entry and
+                                // unicast to us is dropped. Announce right away so
+                                // the MAC table converges with the link.
+                                bus.publish(BusMsg::Announce(mesh.my_record())).await;
                             }
                             crate::mesh::MeshEvent::PeerDown(id) => {
                                 tracing::debug!(peer = %id.fmt_short(), "mesh event: peer down");

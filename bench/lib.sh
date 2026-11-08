@@ -39,10 +39,12 @@ BENCH_READY_TIMEOUT="${BENCH_READY_TIMEOUT:-90}"
 # overlay for one ping and then lost it. Require consecutive successes.
 BENCH_READY_STREAK="${BENCH_READY_STREAK:-3}"
 # Per-profile liveness check. A relay link that dropped under the previous
-# profile is redialed by the node itself, so one failed ping right after the
-# qdisc is cleared is expected, not a dead overlay. 20 x 2s comfortably covers
-# the mesh's 30s backoff ceiling plus a QUIC handshake on an impaired path.
-BENCH_OVERLAY_RETRIES="${BENCH_OVERLAY_RETRIES:-20}"
+# profile is redialed by the node itself, but a silently blackholed QUIC path
+# is only detected when the 30s idle timeout fires, and a two-hop topology can
+# lose both hops in sequence. Measured worst case: ~90s from the first drop
+# until the overlay answers again (30s detect + redial, twice, plus re-ARP).
+# 40 attempts x (<=2s ping + 2s sleep) ~= 160s covers that with margin.
+BENCH_OVERLAY_RETRIES="${BENCH_OVERLAY_RETRIES:-40}"
 BENCH_OVERLAY_RETRY_INTERVAL="${BENCH_OVERLAY_RETRY_INTERVAL:-2}"
 BENCH_PING_COUNT="${BENCH_PING_COUNT:-20}"
 # status.json is written every 5s; wait for one more tick before collecting
