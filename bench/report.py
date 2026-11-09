@@ -38,6 +38,11 @@ BASELINE_PROFILES = frozenset({"clean"})
 
 RTT_RE = re.compile(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms")
 LOSS_RE = re.compile(r"([\d.]+)%\s*packet loss")
+# `irohlan_mesh_frames_total{direction="tx",path="datagram"} 1234`
+MESH_PATH_RE = re.compile(
+    r'^irohlan_mesh_frames_total\{direction="([a-z]+)",path="([a-z]+)"\}\s+(\d+)$',
+    re.MULTILINE,
+)
 
 
 def load_json(path):
@@ -104,6 +109,20 @@ def delta(before, after, key):
     return max(0, (after.get(key, 0) or 0) - (before.get(key, 0) or 0))
 
 
+def mesh_tx_split(directory, pattern):
+    """Sum `(datagram, stream)` sent-payload counts over matching .prom files."""
+    datagram = stream = 0
+    for path in sorted(directory.glob(pattern)):
+        for direction, wire_path, value in MESH_PATH_RE.findall(read_text(path)):
+            if direction != "tx":
+                continue
+            if wire_path == "datagram":
+                datagram += int(value)
+            elif wire_path == "stream":
+                stream += int(value)
+    return datagram, stream
+
+
 def collect_dir(meta_path):
     d = meta_path.parent
     mode = d.parent.name
@@ -146,6 +165,22 @@ def collect_dir(meta_path):
         for p in sorted(d.glob("http-metrics-*.prom"))
         if "irohlan_up 1" in read_text(p)
     )
+
+    # How the payloads actually travelled. Every full-size frame that no longer
+    # fits a QUIC datagram costs a uni-stream slot that the peer only returns
+    # after a round trip, so a high stream share explains a throughput ceiling
+    # that the link itself does not. Nodes are restarted per mode, not per
+    # profile, so the counters in metrics.prom are cumulative: subtract the
+    # snapshot taken before the profile to get that profile's own share. The
+    # snapshot is at most one 5s flush stale, which only moves a handful of
+    # frames across a profile boundary.
+    before_dg, before_st = mesh_tx_split(d, "before-metrics-*.prom")
+    after_dg, after_st = mesh_tx_split(d, "metrics-*.prom")
+    datagram_frames = max(0, after_dg - before_dg)
+    stream_frames = max(0, after_st - before_st)
+    sent_frames = datagram_frames + stream_frames
+    stream_share = round(100.0 * stream_frames / sent_frames, 1) if sent_frames else None
+
     errors = [e for e in read_text(d / "errors.txt").strip().splitlines() if e]
     return {
         "mode": mode,
@@ -173,6 +208,8 @@ def collect_dir(meta_path):
         "relay_frames_delta": relayed,
         "limited_frames_delta": limited,
         "codel_frames_delta": codel,
+        "mesh_stream_frames": stream_frames,
+        "mesh_stream_share_pct": stream_share,
         "queued_frames": queued,
         "active_flows": active_flows,
         "active_peers": active_peers,
@@ -291,7 +328,7 @@ def markdown(data):
     header = (
         "| mode | profile | netem | TCP Mbps | ΔTCP | UDP Mbps | "
         "UDP loss | ping ms | ping(load) | v6 ping ms | link RTT/loss‰ | "
-        "relayed | limited | CoDel | flows |"
+        "relayed | limited | CoDel | flows | stream% |"
     )
     lines.append(header)
     lines.append("|" + "---|" * (header.count("|") - 1))
@@ -305,7 +342,7 @@ def markdown(data):
         lines.append(
             "| {mode} | {profile} | `{netem}` | {tcp} | {drop} | {udp} | {uloss} | "
             "{ping} | {pingload} | {ping6} | {link} | {relayed} | {limited} | "
-            "{codel} | {flows} |".format(
+            "{codel} | {flows} | {stream} |".format(
                 mode=r["mode"],
                 profile=r["profile"],
                 netem=r["netem"],
@@ -321,6 +358,7 @@ def markdown(data):
                 limited=r["limited_frames_delta"],
                 codel=r["codel_frames_delta"],
                 flows=r["active_flows"],
+                stream=fmt(r["mesh_stream_share_pct"], "%"),
             )
         )
     lines.append("")
@@ -343,6 +381,14 @@ def markdown(data):
         "all nodes. In `direct` mode there is no relay hop, so they stay at 0 "
         "by design. `flows` is the instantaneous active-flow count at the end "
         "of the profile. `v6 ping ms` is empty unless `--ipv6` was used."
+    )
+    lines.append("")
+    lines.append(
+        "> `stream%` is the share of *sent* payloads that left on a per-frame "
+        "uni-directional stream instead of a QUIC datagram, summed over all "
+        "nodes (`irohlan_mesh_frames_total`). Each stream costs a slot that the "
+        "peer only returns after a round trip, so a high share means the "
+        "MTU/datagram budget — not the link — is capping throughput."
     )
     return "\n".join(lines) + "\n"
 

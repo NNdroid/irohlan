@@ -204,14 +204,21 @@ flow 队列:每条流上限 64 帧 / 128 KiB(一个 peer 合计 512 帧 / 512 Ki
 **`metrics-addr`** 在本机回环开一个极简 HTTP 端点,
 `curl http://127.0.0.1:9090/metrics` 即可抓 Prometheus 文本格式指标:
 relay 全局/逐 peer 累计计数、队列积压、逐链路 RTT / 丢包率 / 吞吐 / 带宽估计,
-以及每条选中路径的加权代价。**只接受回环地址**(非 loopback 会直接报错、拒绝绑定),
-端口本身也不做认证,不要用端口转发把它暴露到公网。无论是否开 HTTP,每 5 秒
-都会把同一份指标写到状态目录的 `metrics.prom`,可直接交给 node_exporter 的
-textfile collector。中继的**累计**帧数/字节数同时写入 `relay-ledger.json`
-(临时文件 + rename 原子替换),启动时读回并累加,重启不再归零;瞬时状态
-(队列积压、活跃 peer/flow)不持久化。`metrics-addr` 会写进 `network.json`,
-`irohlan run` 默认继承;本次临时关闭用 `"no-metrics": true`,临时换端口用
-`"metrics-addr": "127.0.0.1:9101"`。
+每条选中路径的加权代价,以及 **datagram / 单向流的收发分流**
+(`irohlan_mesh_frames_total` / `irohlan_mesh_bytes_total`,标签
+`direction`=`tx|rx`、`path`=`datagram|stream`,外加
+`irohlan_mesh_stream_fallbacks_total`)。**只接受回环地址**(非 loopback 会直接
+报错、拒绝绑定),端口本身也不做认证,不要用端口转发把它暴露到公网。无论是否开
+HTTP,每 5 秒都会把同一份指标写到状态目录的 `metrics.prom`,可直接交给
+node_exporter 的 textfile collector。中继的**累计**帧数/字节数同时写入
+`relay-ledger.json`(临时文件 + rename 原子替换),启动时读回并累加,重启不再
+归零;瞬时状态(队列积压、活跃 peer/flow、wire-path 分流计数)不持久化。
+`metrics-addr` 会写进 `network.json`,`irohlan run` 默认继承;本次临时关闭用
+`"no-metrics": true`,临时换端口用 `"metrics-addr": "127.0.0.1:9101"`。
+
+吞吐不达预期时**先看 `irohlan_mesh_frames_total{path="stream"}` 的占比**:单向流
+路径要按帧占用一个流槽位、且槽位要等对端回收(一个 RTT)才还回来,占比高就意味着
+吞吐被 `槽位数 × 载荷 / RTT` 卡住,而不是链路不够快。
 
 ## 权限与部署
 
@@ -254,6 +261,13 @@ sudo systemctl enable --now irohlan@$USER
    以太网一致,主机侧不分片):不超过 QUIC datagram 上限的小帧(ARP、NDP、ACK、
    小包)走 datagram 快路径,更大的帧自动改走独立单向流(每帧一条流,
    帧间无队头阻塞)。
+   > **注意**:datagram 预算只有 `路径 MTU − 38` 字节(PMTU 探测上限 1452,
+   > 即 1414),而 1500 的 MTU 会产出最长 1514 字节的以太帧,加上 2 字节
+   > mesh 头必然超限 —— 所以**满尺寸数据帧实际全部走单向流**,datagram 快路径
+   > 只服务小帧。单向流的流槽位要等对端回收(一个 RTT)才还回来,因此它把吞吐
+   > 上限压到 `流槽位数 × 载荷 / RTT`。判据就是
+   > `irohlan_mesh_frames_total{path="stream"}` 的占比;把 `mtu` 降到 1280
+   > 可以让满尺寸帧重新回到 datagram。
 3. **链路质量加权链路状态路由**:每个节点把自己的**当前邻居 + 每条链路的 QUIC
    实测质量**作为 LSA(链路状态通告)经广播总线分发(连接变化即发布,30s 周期
    刷新,90s 过期)。四个维度全部取自 iroh 选中路径的 `PathStats`,不需要主动探测包:

@@ -15,11 +15,21 @@ use crate::netaddr::{AddrPlan, VirtualAddrs};
 ///
 /// 1500 matches a regular Ethernet network and is above the 1280-byte minimum
 /// IPv6 link MTU, so the host protocol stack never fragments and path-MTU
-/// blackholes are avoided. Frames larger than the QUIC datagram limit (~1200
-/// bytes of payload on a 1500-byte path) automatically take the uni-stream
-/// overflow path in `mesh::send_payload` — one stream per frame, so there is
-/// no head-of-line blocking between frames. Smaller frames (ARP, NDP, TCP
-/// ACKs, small packets) keep using the datagram fast path.
+/// blackholes are avoided.
+///
+/// Note what this costs on the wire. A QUIC datagram budget is
+/// `current_mtu - 38` bytes (QUIC header plus AEAD tag plus the datagram frame
+/// header), i.e. 1414 bytes once PMTU discovery has settled at its 1452-byte
+/// upper bound. A 1500-byte MTU produces ethernet frames of up to 1514 bytes,
+/// so with the two-byte mesh header (`tag`, `hop`) **every full-size frame
+/// takes the uni-stream overflow path** — one stream per frame, and a stream
+/// slot is only returned a round trip later. Small frames (ARP, NDP, TCP ACKs)
+/// still use the datagram fast path.
+///
+/// That is a deliberate trade (no host-side fragmentation) but it is the first
+/// thing to look at when throughput sits far below the link capacity: see
+/// `irohlan_mesh_frames_total{path="stream"}`. Lowering `mtu` to 1280 moves
+/// full-size frames back onto datagrams.
 pub const DEFAULT_MTU: u16 = 1500;
 
 /// Async handle to a TAP device.

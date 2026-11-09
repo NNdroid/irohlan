@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::mesh::MeshSnapshot;
 use crate::proto::{IdBytes, LinkMetric};
 use crate::relay::{PeerStats, RelaySnapshot};
 
@@ -28,6 +29,8 @@ pub struct MetricsInput<'a> {
     pub links: &'a [LinkMetric],
     /// `(destination, first hop, weighted cost)`.
     pub routes: &'a [(IdBytes, IdBytes, u64)],
+    /// How payloads actually travelled (QUIC datagram vs uni-stream).
+    pub mesh: MeshSnapshot,
     pub frames_from_tap: u64,
     pub frames_to_tap: u64,
     pub frames_dropped: u64,
@@ -133,6 +136,73 @@ pub fn render(input: &MetricsInput<'_>) -> String {
         &mut out,
         "irohlan_frames_dropped_total",
         input.frames_dropped,
+        &[],
+    );
+
+    // Wire-path split. A high `path="stream"` share means full-size frames no
+    // longer fit a QUIC datagram, so each one costs a stream slot that the
+    // peer only returns after a round trip — the usual cause of throughput far
+    // below the link capacity.
+    header(
+        &mut out,
+        "irohlan_mesh_frames_total",
+        "counter",
+        "Payloads sent or received, split by QUIC path (datagram vs per-frame uni-stream).",
+    );
+    for (direction, tx) in [("tx", true), ("rx", false)] {
+        let (datagram, stream) = if tx {
+            (input.mesh.tx_datagram_frames, input.mesh.tx_stream_frames)
+        } else {
+            (input.mesh.rx_datagram_frames, input.mesh.rx_stream_frames)
+        };
+        sample(
+            &mut out,
+            "irohlan_mesh_frames_total",
+            datagram,
+            &[("direction", direction), ("path", "datagram")],
+        );
+        sample(
+            &mut out,
+            "irohlan_mesh_frames_total",
+            stream,
+            &[("direction", direction), ("path", "stream")],
+        );
+    }
+    header(
+        &mut out,
+        "irohlan_mesh_bytes_total",
+        "counter",
+        "Bytes sent or received, split by QUIC path (datagram vs per-frame uni-stream).",
+    );
+    for (direction, tx) in [("tx", true), ("rx", false)] {
+        let (datagram, stream) = if tx {
+            (input.mesh.tx_datagram_bytes, input.mesh.tx_stream_bytes)
+        } else {
+            (input.mesh.rx_datagram_bytes, input.mesh.rx_stream_bytes)
+        };
+        sample(
+            &mut out,
+            "irohlan_mesh_bytes_total",
+            datagram,
+            &[("direction", direction), ("path", "datagram")],
+        );
+        sample(
+            &mut out,
+            "irohlan_mesh_bytes_total",
+            stream,
+            &[("direction", direction), ("path", "stream")],
+        );
+    }
+    header(
+        &mut out,
+        "irohlan_mesh_stream_fallbacks_total",
+        "counter",
+        "Datagram sends that failed (e.g. path-MTU shrink) and were retried as a uni-stream.",
+    );
+    sample(
+        &mut out,
+        "irohlan_mesh_stream_fallbacks_total",
+        input.mesh.tx_stream_fallbacks,
         &[],
     );
 
@@ -405,6 +475,17 @@ mod tests {
             relay,
             links,
             routes,
+            mesh: MeshSnapshot {
+                tx_datagram_frames: 100,
+                tx_datagram_bytes: 9_000,
+                tx_stream_frames: 7,
+                tx_stream_bytes: 10_500,
+                tx_stream_fallbacks: 2,
+                rx_datagram_frames: 50,
+                rx_datagram_bytes: 4_000,
+                rx_stream_frames: 1,
+                rx_stream_bytes: 1_500,
+            },
             frames_from_tap: 10,
             frames_to_tap: 8,
             frames_dropped: 1,
@@ -448,6 +529,32 @@ mod tests {
         assert!(!text.contains("\r\n"), "text exposition uses LF only");
         // Every HELP/TYPE pair appears exactly once, even with many samples.
         assert_eq!(text.matches("# TYPE irohlan_up gauge").count(), 1);
+    }
+
+    #[test]
+    fn render_splits_the_wire_path_by_direction_and_path() {
+        let relay = RelaySnapshot::default();
+        let text = render(&input(&relay, &[], &[]));
+
+        assert!(text.contains("# TYPE irohlan_mesh_frames_total counter"));
+        assert!(text.contains("irohlan_mesh_frames_total{direction=\"tx\",path=\"datagram\"} 100"));
+        assert!(text.contains("irohlan_mesh_frames_total{direction=\"tx\",path=\"stream\"} 7"));
+        assert!(text.contains("irohlan_mesh_frames_total{direction=\"rx\",path=\"datagram\"} 50"));
+        assert!(text.contains("irohlan_mesh_frames_total{direction=\"rx\",path=\"stream\"} 1"));
+        assert!(text.contains("irohlan_mesh_bytes_total{direction=\"tx\",path=\"stream\"} 10500"));
+        assert!(text.contains("irohlan_mesh_bytes_total{direction=\"rx\",path=\"datagram\"} 4000"));
+        assert!(text.contains("irohlan_mesh_stream_fallbacks_total 2"));
+        // One HELP/TYPE pair per metric, shared by all four labelled samples.
+        assert_eq!(
+            text.matches("# TYPE irohlan_mesh_frames_total counter")
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.matches("# TYPE irohlan_mesh_bytes_total counter")
+                .count(),
+            1
+        );
     }
 
     #[test]

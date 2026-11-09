@@ -675,6 +675,10 @@ bench_snapshot_before() {
     for node in "${BENCH_NODES[@]}"; do
         s=$(state_of "$node")
         cp "$s/status.json" "$out/before-$node.json" 2>/dev/null || true
+        # metrics.prom carries the cumulative wire-path split (datagram vs
+        # per-frame uni-stream); the report subtracts this snapshot so each
+        # profile gets its own share even though nodes outlive the profile.
+        cp "$s/metrics.prom" "$out/before-metrics-$node.prom" 2>/dev/null || true
     done
 }
 

@@ -6,7 +6,10 @@
 //!   `FRAME` = raw ethernet frame, `FLOOD` = postcard-encoded
 //!   [`FloodEnvelope`].
 //! * **uni-directional streams** — overflow path for payloads that do not fit
-//!   into a datagram (same tag byte as datagrams).
+//!   into a datagram (same tag byte as datagrams). One payload per stream, so
+//!   there is no head-of-line blocking between payloads, but each stream costs
+//!   a stream slot that only comes back after the peer retires it — see
+//!   [`MeshCounters`] for the counter that tells the two paths apart.
 //! * **bi-directional streams** — the first one carries the auth handshake
 //!   (length-prefixed [`CtrlMsg`]), later ones carry control requests
 //!   (`RequestIp` …), also length-prefixed.
@@ -20,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use iroh::endpoint::Connection;
 use iroh::endpoint::VarInt;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -53,6 +56,64 @@ const RECONNECT_MIN_BACKOFF: Duration = Duration::from_secs(1);
 /// Upper bound on the retry delay. netem runs of several minutes can keep a
 /// link unusable for a while, and the reconnect must not spin on it.
 const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Wire-path counters: how payloads actually left and arrived.
+///
+/// Every payload takes exactly one of two paths — an unreliable QUIC datagram
+/// or a per-payload uni-directional stream — and the split is the first thing
+/// to look at when throughput is below what the link can carry. The overflow
+/// path is not free: each payload consumes one stream slot, the peer only
+/// returns that slot after it retires the stream (a round trip), so a high
+/// stream share caps throughput at `stream slots x payload / RTT` regardless
+/// of the available bandwidth. With the noq default of 100 slots that ceiling
+/// is ~39 Mbit/s at a 30 ms RTT.
+///
+/// The size-driven overflow used to be invisible: it produced no log line at
+/// all, and the only "fallback" message fired on a failed datagram *send*.
+#[derive(Debug, Default)]
+pub struct MeshCounters {
+    tx_datagram_frames: AtomicU64,
+    tx_datagram_bytes: AtomicU64,
+    tx_stream_frames: AtomicU64,
+    tx_stream_bytes: AtomicU64,
+    /// Datagram sends that failed and were retried as a stream.
+    tx_stream_fallbacks: AtomicU64,
+    rx_datagram_frames: AtomicU64,
+    rx_datagram_bytes: AtomicU64,
+    rx_stream_frames: AtomicU64,
+    rx_stream_bytes: AtomicU64,
+}
+
+/// Point-in-time copy of [`MeshCounters`] for one metrics scrape.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MeshSnapshot {
+    pub tx_datagram_frames: u64,
+    pub tx_datagram_bytes: u64,
+    pub tx_stream_frames: u64,
+    pub tx_stream_bytes: u64,
+    pub tx_stream_fallbacks: u64,
+    pub rx_datagram_frames: u64,
+    pub rx_datagram_bytes: u64,
+    pub rx_stream_frames: u64,
+    pub rx_stream_bytes: u64,
+}
+
+impl MeshCounters {
+    pub fn snapshot(&self) -> MeshSnapshot {
+        let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        MeshSnapshot {
+            tx_datagram_frames: load(&self.tx_datagram_frames),
+            tx_datagram_bytes: load(&self.tx_datagram_bytes),
+            tx_stream_frames: load(&self.tx_stream_frames),
+            tx_stream_bytes: load(&self.tx_stream_bytes),
+            tx_stream_fallbacks: load(&self.tx_stream_fallbacks),
+            rx_datagram_frames: load(&self.rx_datagram_frames),
+            rx_datagram_bytes: load(&self.rx_datagram_bytes),
+            rx_stream_frames: load(&self.rx_stream_frames),
+            rx_stream_bytes: load(&self.rx_stream_bytes),
+        }
+    }
+}
 
 /// Events emitted when mesh connections come and go.
 #[derive(Clone, Copy, Debug)]
@@ -89,13 +150,17 @@ enum OutMsg {
         frame: Bytes,
     },
     /// Tagged payload ready for the wire (datagram or stream).
-    Tagged(Vec<u8>),
+    ///
+    /// The tag byte is already in front; nothing else has to be prepended, so
+    /// the bytes can go out as-is (a `Vec` converts to `Bytes` without a copy).
+    Tagged(Bytes),
 }
 
 struct PeerHandle {
     conn: Connection,
     stable_id: usize,
     out_tx: mpsc::Sender<OutMsg>,
+    counters: Arc<MeshCounters>,
 }
 
 /// Cumulative QUIC counters from the previous link-quality sample. Loss and
@@ -142,6 +207,7 @@ struct Shared {
     /// Flood envelopes received from remote peers (flood bus input).
     flood_tx: mpsc::Sender<(EndpointId, FloodEnvelope)>,
     event_tx: broadcast::Sender<MeshEvent>,
+    counters: Arc<MeshCounters>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -174,14 +240,18 @@ impl Shared {
     }
 
     /// Send a tagged payload to all peers except `exclude`.
+    ///
+    /// The payload is copied once and then shared by every peer's queue: a
+    /// flood to N peers used to make N copies of the whole envelope.
     fn flood_out(&self, tagged: &[u8], exclude: Option<EndpointId>) {
+        let tagged = Bytes::copy_from_slice(tagged);
         let peers = self.peers.lock().expect("peers lock");
         for (id, handles) in peers.iter() {
             if Some(*id) == exclude {
                 continue;
             }
             for handle in handles {
-                let _ = handle.out_tx.try_send(OutMsg::Tagged(tagged.to_vec()));
+                let _ = handle.out_tx.try_send(OutMsg::Tagged(tagged.clone()));
             }
         }
     }
@@ -512,6 +582,7 @@ fn register_conn(shared: &Arc<Shared>, conn: Connection) {
         conn: conn.clone(),
         stable_id,
         out_tx,
+        counters: shared.counters.clone(),
     });
 
     shared
@@ -650,16 +721,10 @@ async fn outbound_pump(handle: Arc<PeerHandle>, mut out_rx: mpsc::Receiver<OutMs
         let max_dgram = handle.conn.max_datagram_size().unwrap_or(0);
         let result = match msg {
             OutMsg::Frame { hop, frame } => {
-                // Wire shape: [tag][hop][frame…]
-                let mut payload = BytesMut::with_capacity(frame.len() + 1);
-                payload.extend_from_slice(&[hop]);
-                payload.extend_from_slice(&frame);
-                send_payload(&handle, tag::FRAME, payload.freeze(), max_dgram).await
+                let payload = wire_payload(tag::FRAME, hop, &frame);
+                send_payload(&handle, payload, max_dgram).await
             }
-            OutMsg::Tagged(payload) => {
-                let (t, rest) = payload.split_first().expect("tagged payload has tag");
-                send_payload(&handle, *t, Bytes::copy_from_slice(rest), max_dgram).await
-            }
+            OutMsg::Tagged(payload) => send_payload(&handle, payload, max_dgram).await,
         };
         if let Err(err) = result {
             // A single oversized datagram or a broken stream must NOT retire
@@ -672,33 +737,45 @@ async fn outbound_pump(handle: Arc<PeerHandle>, mut out_rx: mpsc::Receiver<OutMs
     }
 }
 
-/// Send a tagged payload: datagram when it fits, uni-stream otherwise.
+/// Build the wire payload `[tag][hop][frame…]` in a single allocation.
+///
+/// The previous shape built `[hop][frame…]` here and then copied the whole
+/// thing again in [`send_payload`] just to put the tag in front — one full
+/// frame memcpy per forwarded frame for a two-byte header.
+fn wire_payload(tag_byte: u8, hop: u8, frame: &Bytes) -> Bytes {
+    let mut buf = BytesMut::with_capacity(2 + frame.len());
+    buf.put_slice(&[tag_byte, hop]);
+    buf.put_slice(frame);
+    buf.freeze()
+}
+
+/// Send one payload that is already in wire form (tag byte first).
 ///
 /// A datagram failure (for example a path-MTU shrink between the size check
 /// and the send) falls back to a uni-stream instead of failing the message.
-async fn send_payload(
-    handle: &PeerHandle,
-    tag_byte: u8,
-    payload: Bytes,
-    max_dgram: usize,
-) -> anyhow::Result<()> {
-    let mut datagram = BytesMut::with_capacity(payload.len() + 1);
-    datagram.extend_from_slice(&[tag_byte]);
-    datagram.extend_from_slice(&payload);
-    let datagram = datagram.freeze();
+async fn send_payload(handle: &PeerHandle, payload: Bytes, max_dgram: usize) -> anyhow::Result<()> {
+    let len = payload.len() as u64;
+    let counters = &handle.counters;
 
-    if max_dgram > 0 && datagram.len() <= max_dgram {
-        match handle.conn.send_datagram_wait(datagram.clone()).await {
-            Ok(()) => return Ok(()),
+    if max_dgram > 0 && payload.len() <= max_dgram {
+        match handle.conn.send_datagram_wait(payload.clone()).await {
+            Ok(()) => {
+                counters.tx_datagram_frames.fetch_add(1, Ordering::Relaxed);
+                counters.tx_datagram_bytes.fetch_add(len, Ordering::Relaxed);
+                return Ok(());
+            }
             Err(err) => {
+                counters.tx_stream_fallbacks.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("datagram send failed, falling back to uni stream: {err}");
             }
         }
     }
     // Overflow path: one uni-directional stream per payload.
     let mut send = handle.conn.open_uni().await?;
-    send.write_all(&datagram).await?;
+    send.write_all(&payload).await?;
     send.finish().ok();
+    counters.tx_stream_frames.fetch_add(1, Ordering::Relaxed);
+    counters.tx_stream_bytes.fetch_add(len, Ordering::Relaxed);
     Ok(())
 }
 
@@ -708,7 +785,12 @@ async fn inbound_pump(shared: Arc<Shared>, handle: Arc<PeerHandle>) {
         tokio::select! {
             dg = conn.read_datagram() => {
                 match dg {
-                    Ok(data) => ingest_tagged(&shared, &conn.remote_id(), &data),
+                    Ok(data) => {
+                        let counters = &shared.counters;
+                        counters.rx_datagram_frames.fetch_add(1, Ordering::Relaxed);
+                        counters.rx_datagram_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        ingest_tagged(&shared, &conn.remote_id(), data);
+                    }
                     Err(_) => break,
                 }
             }
@@ -725,7 +807,14 @@ async fn inbound_pump(shared: Arc<Shared>, handle: Arc<PeerHandle>) {
                         tokio::spawn(async move {
                             let mut recv = recv;
                             match recv.read_to_end(MAX_STREAM_MSG_LEN).await {
-                                Ok(data) => ingest_tagged(&shared, &from, &data),
+                                Ok(data) => {
+                                    let counters = &shared.counters;
+                                    counters.rx_stream_frames.fetch_add(1, Ordering::Relaxed);
+                                    counters
+                                        .rx_stream_bytes
+                                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                                    ingest_tagged(&shared, &from, Bytes::from(data));
+                                }
                                 Err(err) => tracing::debug!("uni stream read failed: {err}"),
                             }
                         });
@@ -738,25 +827,36 @@ async fn inbound_pump(shared: Arc<Shared>, handle: Arc<PeerHandle>) {
     }
 }
 
-fn ingest_tagged(shared: &Shared, from: &EndpointId, data: &[u8]) {
-    let Some((tag_byte, rest)) = data.split_first() else {
+/// Split a received `tag::FRAME` payload into `(hop, frame)`, zero copy.
+///
+/// The frame stays a slice of the received buffer: the hand-off to the switch
+/// is a reference-count bump instead of a full frame memcpy.
+fn split_frame(payload: Bytes) -> Option<(u8, Bytes)> {
+    if payload.len() < 2 {
+        return None;
+    }
+    Some((payload[1], payload.slice(2..)))
+}
+
+fn ingest_tagged(shared: &Shared, from: &EndpointId, data: Bytes) {
+    let Some(&tag_byte) = data.first() else {
         return;
     };
-    match *tag_byte {
+    match tag_byte {
         tag::FRAME => {
-            // Payload shape: [hop: u8][frame…]
-            let Some((&hop, frame)) = rest.split_first() else {
+            // Payload shape: [tag][hop: u8][frame…]
+            let Some((hop, frame)) = split_frame(data) else {
                 return;
             };
             if let Err(err) = shared.frame_tx.try_send(InboundFrame {
                 from: *from,
                 hop,
-                frame: Bytes::copy_from_slice(frame),
+                frame,
             }) {
                 tracing::warn!(peer = %from.fmt_short(), "inbound frame channel rejected: {err}");
             }
         }
-        tag::FLOOD => match postcard::from_bytes::<FloodEnvelope>(rest) {
+        tag::FLOOD => match postcard::from_bytes::<FloodEnvelope>(&data[1..]) {
             Ok(envelope) => {
                 if let Err(err) = shared.flood_tx.try_send((*from, envelope)) {
                     tracing::warn!(peer = %from.fmt_short(), "inbound flood channel rejected: {err}");
@@ -825,6 +925,7 @@ impl Mesh {
             frame_tx,
             flood_tx,
             event_tx,
+            counters: Arc::new(MeshCounters::default()),
         });
 
         // Redial worker for links we initiated; survives every peer churn.
@@ -884,6 +985,11 @@ impl Mesh {
             .keys()
             .copied()
             .collect()
+    }
+
+    /// How payloads actually left and arrived (datagram vs uni-stream).
+    pub fn counters(&self) -> MeshSnapshot {
+        self.shared.counters.snapshot()
     }
 
     /// Measured QUIC link quality for every directly connected peer.
@@ -1033,5 +1139,62 @@ impl Mesh {
 
     pub async fn shutdown(&self) {
         let _ = self.router.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_payload_puts_the_tag_and_hop_in_front() {
+        let frame = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
+        let payload = wire_payload(tag::FRAME, 7, &frame);
+        assert_eq!(&payload[..], &[tag::FRAME, 7, 0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn split_frame_round_trips_wire_payload() {
+        let frame = Bytes::from_static(&[1, 2, 3, 4, 5, 6]);
+        let payload = wire_payload(tag::FRAME, 9, &frame);
+        let (hop, rest) = split_frame(payload).expect("frame payload splits");
+        assert_eq!(hop, 9);
+        assert_eq!(rest, frame);
+    }
+
+    #[test]
+    fn split_frame_rejects_a_truncated_payload() {
+        // A tag with no hop byte cannot be routed; dropping is the only safe
+        // option (a zero hop byte would be a valid "budget exhausted" value).
+        assert!(split_frame(Bytes::from_static(&[tag::FRAME])).is_none());
+        assert!(split_frame(Bytes::new()).is_none());
+    }
+
+    #[test]
+    fn split_frame_does_not_copy_the_frame() {
+        // Both the payload and the returned frame must point into the same
+        // allocation; if this ever becomes a copy, the zero-copy property that
+        // this module relies on is gone.
+        let payload = Bytes::from(vec![tag::FRAME, 5, 0xaa, 0xbb]);
+        let base = payload.as_ptr() as usize;
+        let (_, frame) = split_frame(payload).expect("frame payload splits");
+        assert_eq!(frame.as_ptr() as usize, base + 2);
+    }
+
+    #[test]
+    fn snapshot_starts_at_zero_and_tracks_each_path_separately() {
+        let counters = MeshCounters::default();
+        let empty = counters.snapshot();
+        assert_eq!(empty.tx_datagram_frames, 0);
+        assert_eq!(empty.tx_stream_frames, 0);
+
+        counters.tx_datagram_frames.fetch_add(3, Ordering::Relaxed);
+        counters.tx_stream_frames.fetch_add(1, Ordering::Relaxed);
+        counters.rx_stream_bytes.fetch_add(1400, Ordering::Relaxed);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.tx_datagram_frames, 3);
+        assert_eq!(snapshot.tx_datagram_bytes, 0);
+        assert_eq!(snapshot.tx_stream_frames, 1);
+        assert_eq!(snapshot.rx_stream_bytes, 1400);
     }
 }

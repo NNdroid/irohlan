@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use iroh::endpoint::presets;
+use iroh::endpoint::{presets, QuicTransportConfig, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_gossip::Gossip;
 use rand::seq::SliceRandom;
@@ -47,6 +47,17 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 const RELAY_DRAIN_INTERVAL: Duration = Duration::from_millis(5);
 /// Read buffer for the TAP device.
 const TAP_BUF_LEN: usize = 65_535;
+
+/// Uni-directional streams a peer may have open towards us at once.
+///
+/// Every payload that does not fit a QUIC datagram travels on its own
+/// uni-directional stream, and a stream slot comes back only after the peer
+/// retires the stream — i.e. after a round trip. noq's default of 100
+/// therefore caps one peer at roughly `100 x payload / RTT`: about 39 Mbit/s
+/// for 1500-byte payloads at a 30 ms RTT, which is exactly the band a relayed
+/// path lives in. 4096 slots is ~6 MiB of worst-case in-flight state per peer
+/// and takes the slot count out of the throughput equation.
+const MAX_UNI_STREAMS: u32 = 4096;
 
 /// Short, human readable endpoint id for status output.
 fn short_id(id: IdBytes) -> String {
@@ -302,7 +313,16 @@ pub async fn run_node(
     } else {
         Endpoint::builder(presets::N0DisableRelay)
     }
-    .secret_key(secret_key);
+    .secret_key(secret_key)
+    // Keep iroh's own transport overrides (heartbeat, path timeouts, multipath
+    // limits) and change only the stream slot count: the builder starts from
+    // `TransportConfig::default()`, so `QuicTransportConfig::builder()` is the
+    // safe way to extend it rather than replacing the whole config.
+    .transport_config(
+        QuicTransportConfig::builder()
+            .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+            .build(),
+    );
     if opts.use_mdns {
         ep_builder = ep_builder.address_lookup(
             iroh_mdns_address_lookup::MdnsAddressLookup::builder()
@@ -567,6 +587,7 @@ pub async fn run_node(
         let relay = relay.clone();
         let routing = routing.clone();
         let counters = counters.clone();
+        let mesh = mesh.clone();
         move || {
             let (from_tap, to_tap, dropped) = counters.snapshot();
             let (links, routes) = {
@@ -582,6 +603,7 @@ pub async fn run_node(
                 relay: &relay_snapshot,
                 links: &links,
                 routes: &routes,
+                mesh: mesh.counters(),
                 frames_from_tap: from_tap,
                 frames_to_tap: to_tap,
                 frames_dropped: dropped,
