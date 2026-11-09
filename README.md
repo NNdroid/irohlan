@@ -56,24 +56,28 @@ mDNS、网络邻居发现、局域网游戏等原生二层流量直接工作。�
 需要 Linux(内核 TUN/TAP 支持,且启用 IPv6)与 root 或 `CAP_NET_ADMIN`。
 
 ```bash
-# 机器 A(创建者),不带 --config 即全部用默认值
-sudo ./irohlan create
+# 机器 A(创建者):复制示例,按需改 subnet / subnet6
+cp create.example.json creator.json && "$EDITOR" creator.json
+sudo ./irohlan create --config creator.json
 # 输出:
-#   addresses : 10.13.37.1, fdXX:XXXX:XXXX::1
-#   subnets   : 10.13.37.0/24, fdXX:XXXX:XXXX::/64
+#   addresses : 10.13.37.1, fd00:1234:5678::1
+#   subnets   : 10.13.37.0/24, fd00:1234:5678::/64
 #   network secret: ABCD2345...
 #   join ticket   : irohlan1_BBBB...
 
-# 机器 B(加入者):口令写进配置文件,省略则交互输入
-echo '{ "dev": "tap0", "secret": "ABCD2345..." }' > member.json
+# 机器 B(加入者):把 secret 换成 A 打印的那个
+cp join.example.json member.json && "$EDITOR" member.json
 sudo ./irohlan join irohlan1_BBBB... --config member.json
 
-# 回到机器 A / B,验证
-ping 10.13.37.2              # IPv4 互 ping
-ping6 fdXX:XXXX:XXXX::2      # IPv6 互 ping(用创建者输出的实际前缀)
-ip -6 neigh show dev tap0    # NDP 学到的对端
-arp -i tap0                  # IPv4 ARP 表项
+# 回到机器 A 验证:B 按示例固定为 10.13.37.7
+ping 10.13.37.7              # IPv4 互 ping
+ping6 fd00:1234:5678::7      # IPv6 互 ping
+ip -6 neigh show dev irohlan0    # NDP 学到的对端
+arp -i irohlan0                  # IPv4 ARP 表项
 ```
+
+> 示例都显式写了 `dev`。不写时设备名由**内核挑**(`tap0`、`tap1`…先后不定),
+> 后面 `ping -I` / `arp -i` 就得每次去看实际名字,脚本化部署时尤其容易踩。
 
 两台机器在同一个局域网时,发现走 mDNS,完全离线可用;跨公网时经 n0 中继
 自动打洞(配置文件里 `"no-relay": true` 可关闭,配合自建 relay 使用)。
@@ -98,18 +102,15 @@ flag,也不会出现"CLI 默认值和引擎默认值各写一遍、改一处漏�
 
 ```json
 {
-  "subnet": "10.42.0.0/24",
-  "secret": "correct horse battery staple",
+  "subnet": "10.13.37.0/24",
+  "subnet6": "fd00:1234:5678::/64",
   "dev": "irohlan0",
-  "mtu": 1400,
-  "no-relay": true,
-  "bus": "flood",
-  "topology": "partial",
-  "mesh-links": 4,
-  "relay-limit-kib": 2048,
+  "mtu": 1500,
   "metrics-addr": "127.0.0.1:9090"
 }
 ```
+
+这就是根目录的 [`create.example.json`](create.example.json),`cp` 过去改几个值即可。
 
 ```bash
 irohlan create --config node.json
@@ -125,14 +126,42 @@ irohlan run --config node.json                      # 只覆盖想改的那几�
 
 `irohlan <子命令> --help` 会把上面这些键连同一个完整示例打印出来,不用翻文档。
 
+根目录下有三个可直接复制改用的最小示例(键集严格互斥,拿错文件会立刻报
+`unknown field`):
+
+| 文件 | 用于 | 里面写了什么 |
+|---|---|---|
+| [`create.example.json`](create.example.json) | `irohlan create --config` | 子网、**钉住的 IPv6 前缀**(`subnet6`)、设备名、MTU、metrics 端口。**故意不写 `secret`** —— 创建者会自动生成并打印 |
+| [`join.example.json`](join.example.json) | `irohlan join <ticket> --config` | 口令(`secret` 改成创建者打印的那个)、固定虚拟 IPv4 + **配对的 IPv6**、设备名;ticket 走位置参数 |
+| [`run.example.json`](run.example.json) | `irohlan run --config` | 只覆盖两项:**临时关掉持久化的中继上限**,其余沿用 `network.json` |
+
+前两个文件是**成对**的:`subnet6` 把前缀定在 `fd00:1234:5678::/64`,`join` 的 `ip` /
+`ip6` 都落在 host index 7 上(`10.13.37.7` ↔ `fd00:1234:5678::7`)。如果创建者不写
+`subnet6`(用自动派生的 ULA),请把 `join` 侧的 `ip6` 一并删掉 —— 前缀此时只有运行时
+才知道,写死会报 `... is outside the virtual subnet`。
+
+```bash
+cp create.example.json creator.json && "$EDITOR" creator.json
+sudo ./irohlan create --config creator.json
+
+cp join.example.json member.json && "$EDITOR" member.json   # 填入口令
+sudo ./irohlan join irohlan1_BBBB... --config member.json
+```
+
+三个文件由 `shipped_examples_parse` 测试守着:改键名、删文件或让示例变得不可解析,
+`cargo test` 会直接失败。
+
 规则:
 
 - **键名 = 历史长参数的 kebab-case 形式**(`--relay-limit-kib` → `"relay-limit-kib"`,
   `--no-relay` → `"no-relay"`),老 runbook / issue 里的写法仍然对得上。
-- **每个键都可省略**,省略即用内置默认值;**唯一的例外是 `run`**:`dev` /
-  `topology` / `mesh-links` / `relay-limit-kib` / `metrics-addr` 省略时回落到
-  `network.json` 里的持久化值,而不是重置成默认值。优先级为
-  **配置文件 > network.json > 内置默认**。
+- **每个键都可省略**,省略即用内置默认值;**唯一的例外是 `run`**:除 `no-metrics`
+  之外,所有键省略时都回落到 `network.json` 里的持久化值,而不是重置成默认值。
+  优先级为 **配置文件 > network.json > 内置默认**。
+- `create` / `join` 会把 `mtu` / `no-relay` / `no-mdns` / `bus` 和拓扑、中继上限、
+  metrics 端口一起写进 `network.json`,所以**重启后行为不变**:开机自启只跑
+  `irohlan run`,不需要再带一遍配置文件。`dev` 是例外 —— 设备名属于本机资源,
+  不落盘,重启时不给就由内核挑。
 - **未知键直接报错**,不会静默忽略 —— 报错信息会列出该子命令支持的全部键,
   `"relay-limit-kibs"` 这类拼写错误不会悄悄回退成默认值。
 - **命令行不再接受这些参数**:`irohlan create --no-relay` 会报
@@ -147,11 +176,20 @@ irohlan run --config node.json                      # 只覆盖想改的那几�
 `no-ipv4` / `no-ipv6` 建纯单栈网络。启用 IPv6 时 `mtu` 必须 ≥ 1280(RFC 8200 的
 链路 MTU 下限),否则启动报错;默认 1500,纯 IPv4 网络可以用更小的值。
 
+**`ip` / `ip6`(仅 `join`)** 用来申请固定的虚拟地址。两者必须指向**同一个 host
+index**(地址尾部一致,例如 `10.13.37.7` 配 `fd00:1234:5678::7`),否则启动直接报
+`different host indexes`;`ip6` 还必须落在本网络的 IPv6 前缀内 —— 创建者用自动派生
+的 ULA 时,这个前缀只有运行时才知道,此时要么把创建者打印的前缀抄进配置,要么干脆
+不写 `ip6`,让创建者按 `ip` 推出对应的 v6 地址。
+
 **发现与中继** —— `no-relay` 禁用公共 relay(但 iroh 的 `N0DisableRelay` 预设
 **仍会尝试 DNS/pkarr 地址发现**);完全无外网时,gossip 总线仍需可用的 mDNS 才能
 按 EndpointId 拨号,而 `"bus": "flood"` 只沿已建立的 mesh 连接泛洪,可彻底不依赖
 地址发现(离线/隔离网络推荐);`no-mdns` 关闭局域网 mDNS 发现。
 `topology` 取 `partial`(默认,每节点约 `mesh-links` 个邻居)或 `full`。
+
+这四项(`mtu` 也一并)会在 `create` / `join` 时写进 `network.json`,`irohlan run`
+从那里恢复 —— 隔离网络里关掉的 relay 不会在重启后又悄悄打开。
 
 **`relay-limit-kib N`** 把本机**转发**的中继总流量限制为 N KiB/s(按字节计,
 0 = 默认,只记账、不排队也不丢帧)。这个 N 是**总量**,由当前活跃的来源 peer
@@ -525,6 +563,9 @@ ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mo
   join ticket 仍是 v2,v1 ticket 也仍可解码。升级时请整网一起换版本。
 - v1 ticket 仍可解码,会升级为「仅 IPv4」的网络计划;要用双栈,请用新版
   `irohlan show` 重新取 ticket 再加入。
+- `network.json` 新增 `mtu` / `use_relay` / `use_mdns` / `bus` 四个字段(`create` /
+  `join` 时写入),这样重启恢复的是当时的选择而不是内置默认。旧文件没有这些键,
+  读出来是 `None`,表现与升级前一致(MTU 1500、relay 与 mDNS 开、gossip 总线)。
 - 旧 `network.json` / `leases.json` 自动兼容:旧 IPv4 网络升级后会自动获得派生
   的 ULA /64;创建者重启会重写 `ticket.txt`。旧租约按 IPv4 地址反推 host index,
   地址保持稳定。

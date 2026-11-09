@@ -58,6 +58,21 @@ pub struct NetworkConfig {
     /// Optional loopback address for the Prometheus `/metrics` endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics_addr: Option<String>,
+    /// Link MTU chosen at create/join time.
+    ///
+    /// Persisted so `irohlan run` restores it: without this a node created for
+    /// a low-MTU tunnel would come back at 1500 after a reboot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
+    /// Whether the n0 public relay infrastructure is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_relay: Option<bool>,
+    /// Whether LAN mDNS discovery is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_mdns: Option<bool>,
+    /// Broadcast bus implementation ("gossip" | "flood").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<String>,
 }
 
 impl NetworkConfig {

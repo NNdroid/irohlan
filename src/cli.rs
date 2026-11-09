@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 use crate::bus::BusMode;
-use crate::config::{StateDir, StatusReport};
+use crate::config::{NetworkConfig, StateDir, StatusReport};
 use crate::filecfg;
 use crate::netaddr::VirtualAddrs;
 use crate::node::{self, NetworkSpec, RunOptions, V6Choice};
@@ -22,14 +22,20 @@ const CREATE_KEYS: &str = "Config keys (all optional):
   subnet, subnet6, no-ipv4, no-ipv6, secret, dev, mtu, no-relay, no-mdns,
   bus, topology, mesh-links, relay-limit-kib, metrics-addr
 
-Example:
-  {\"subnet\": \"10.42.0.0/24\", \"no-relay\": true, \"relay-limit-kib\": 2048,
-   \"metrics-addr\": \"127.0.0.1:9090\"}";
+Example (see also create.example.json):
+  {\"subnet\": \"10.13.37.0/24\", \"dev\": \"irohlan0\", \"mtu\": 1500,
+   \"metrics-addr\": \"127.0.0.1:9090\"}
+
+Without a \"secret\" key the creator generates one and prints it.";
 
 /// Keys `join` accepts in its config file.
 const JOIN_KEYS: &str = "Config keys (all optional):
   ticket, secret, ip, ip6, dev, mtu, no-relay, no-mdns, bus, topology,
   mesh-links, relay-limit-kib, metrics-addr
+
+Example (see also join.example.json; the ticket stays on the command line):
+  {\"secret\": \"ABCD2345...\", \"ip\": \"10.13.37.7\",
+   \"ip6\": \"fd00:1234:5678::7\", \"dev\": \"irohlan0\"}
 
 The ticket may be given as the positional argument or as the \"ticket\" key.
 Without a secret the node prompts for one.";
@@ -39,8 +45,11 @@ const RUN_KEYS: &str = "Config keys (all optional):
   dev, mtu, no-relay, no-mdns, bus, topology, mesh-links, relay-limit-kib,
   metrics-addr, no-metrics
 
-Everything else is restored from network.json; topology, mesh-links,
-relay-limit-kib and metrics-addr only override the persisted values.";
+Example (see also run.example.json; turn off a persisted relay cap):
+  {\"dev\": \"irohlan0\", \"relay-limit-kib\": 0}
+
+Every key is an override: whatever you leave out is restored from
+network.json, including the addresses and the network secret.";
 
 #[derive(Parser)]
 #[command(
@@ -109,8 +118,8 @@ pub enum Command {
 fn run_options(
     dev: Option<String>,
     mtu: u16,
-    no_relay: bool,
-    no_mdns: bool,
+    use_relay: bool,
+    use_mdns: bool,
     bus: &str,
     topology: &str,
     mesh_links: usize,
@@ -118,8 +127,8 @@ fn run_options(
     Ok(RunOptions {
         dev,
         mtu,
-        use_relay: !no_relay,
-        use_mdns: !no_mdns,
+        use_relay,
+        use_mdns,
         bus_mode: BusMode::parse(bus)?,
         desired: VirtualAddrs::default(),
         topology: node::Topology::parse(topology)?,
@@ -130,6 +139,68 @@ fn run_options(
         relay_limit_kib: 0,
         metrics_addr: None,
     })
+}
+
+/// Merge `run` settings over the saved network: config file > network.json >
+/// built-in default.
+///
+/// `network.json` holds the data-plane choices made at create/join time, so a
+/// node set up for an isolated network keeps its `no-relay` / `flood` shape
+/// across a reboot instead of silently reverting to the public relay.
+fn run_options_for_existing(
+    net: &NetworkConfig,
+    cfg: &filecfg::RunConfig,
+) -> anyhow::Result<RunOptions> {
+    let engine = RunOptions::default();
+
+    let use_relay = match cfg.no_relay {
+        Some(disabled) => !disabled,
+        None => net.use_relay.unwrap_or(engine.use_relay),
+    };
+    let use_mdns = match cfg.no_mdns {
+        Some(disabled) => !disabled,
+        None => net.use_mdns.unwrap_or(engine.use_mdns),
+    };
+    let bus = cfg.bus.clone().unwrap_or_else(|| {
+        net.bus
+            .clone()
+            .unwrap_or_else(|| engine.bus_mode.as_str().to_string())
+    });
+    let mtu = cfg.mtu.or(net.mtu).unwrap_or(engine.mtu);
+    let topology = cfg.topology.clone().unwrap_or_else(|| {
+        net.topology
+            .clone()
+            .unwrap_or_else(|| engine.topology.as_str().to_string())
+    });
+    let mesh_links = cfg
+        .mesh_links
+        .or_else(|| net.mesh_links.map(|n| n as usize))
+        .unwrap_or(engine.mesh_links);
+
+    let mut opts = run_options(
+        cfg.dev.clone(),
+        mtu,
+        use_relay,
+        use_mdns,
+        &bus,
+        &topology,
+        mesh_links,
+    )?;
+    opts.desired = net.static_addrs();
+    opts.relay_limit_kib = cfg
+        .relay_limit_kib
+        .or(net.relay_limit_kib)
+        .unwrap_or(engine.relay_limit_kib);
+    opts.metrics_addr = if cfg.no_metrics {
+        None
+    } else {
+        cfg.metrics_addr.or_else(|| {
+            net.metrics_addr
+                .as_deref()
+                .and_then(|s| s.parse::<SocketAddr>().ok())
+        })
+    };
+    Ok(opts)
 }
 
 fn network_spec(
@@ -206,8 +277,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let mut opts = run_options(
                 cfg.dev,
                 cfg.mtu,
-                cfg.no_relay,
-                cfg.no_mdns,
+                !cfg.no_relay,
+                !cfg.no_mdns,
                 &cfg.bus,
                 &cfg.topology,
                 cfg.mesh_links,
@@ -237,8 +308,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 ..run_options(
                     cfg.dev,
                     cfg.mtu,
-                    cfg.no_relay,
-                    cfg.no_mdns,
+                    !cfg.no_relay,
+                    !cfg.no_mdns,
                     &cfg.bus,
                     &cfg.topology,
                     cfg.mesh_links,
@@ -252,37 +323,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let cfg = filecfg::load_or_default::<filecfg::RunConfig>(config.as_deref())?;
             let net = state.load_network()?;
             let secret = state.load_secret()?;
-            // Precedence for the override-style settings:
-            // config file > network.json > built-in default.
-            let persisted_topology = net
-                .topology
-                .clone()
-                .unwrap_or_else(|| node::Topology::default().as_str().to_string());
-            let persisted_links = net
-                .mesh_links
-                .map(|n| n as usize)
-                .unwrap_or_else(|| RunOptions::default().mesh_links);
-            let persisted_relay_limit = net.relay_limit_kib.unwrap_or(0);
-            let persisted_metrics = net
-                .metrics_addr
-                .as_deref()
-                .and_then(|s| s.parse::<SocketAddr>().ok());
-            let mut opts = run_options(
-                cfg.dev,
-                cfg.mtu,
-                cfg.no_relay,
-                cfg.no_mdns,
-                &cfg.bus,
-                cfg.topology.as_deref().unwrap_or(&persisted_topology),
-                cfg.mesh_links.unwrap_or(persisted_links),
-            )?;
-            opts.desired = net.static_addrs();
-            opts.relay_limit_kib = cfg.relay_limit_kib.unwrap_or(persisted_relay_limit);
-            opts.metrics_addr = if cfg.no_metrics {
-                None
-            } else {
-                cfg.metrics_addr.or(persisted_metrics)
-            };
+            let opts = run_options_for_existing(&net, &cfg)?;
             node::run_node(&state, net, secret, opts).await
         }
 
@@ -410,8 +451,109 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_bytes, Cli, Command};
+    use super::{format_bytes, run_options_for_existing, Cli, Command, NetworkConfig, RunOptions};
+    use crate::filecfg::RunConfig;
+    use crate::netaddr::V4Net;
+    use crate::proto::IdBytes;
     use clap::{error::ErrorKind, CommandFactory, Parser};
+
+    /// Minimal saved network: only what the `run` merge actually reads.
+    fn saved_network() -> NetworkConfig {
+        NetworkConfig {
+            net_id: IdBytes([7; 32]),
+            v4: Some(V4Net::parse_cidr("10.13.37.0/24").expect("valid cidr")),
+            v6: None,
+            subnet: None,
+            prefix: None,
+            topic_id: IdBytes([9; 32]),
+            creator: None,
+            is_creator: true,
+            static_ip: None,
+            static_ip6: None,
+            topology: Some("partial".into()),
+            mesh_links: Some(3),
+            relay_limit_kib: Some(2048),
+            metrics_addr: Some("127.0.0.1:9090".into()),
+            mtu: Some(1400),
+            use_relay: Some(false),
+            use_mdns: Some(false),
+            bus: Some("flood".into()),
+        }
+    }
+
+    /// The reboot path: `irohlan run` with no config file must reproduce the
+    /// node that `create` set up, instead of re-enabling the public relay.
+    #[test]
+    fn run_restores_the_persisted_data_plane() {
+        let opts = run_options_for_existing(&saved_network(), &RunConfig::default())
+            .expect("valid settings");
+        assert!(!opts.use_relay, "no-relay must survive a reboot");
+        assert!(!opts.use_mdns);
+        assert_eq!(opts.bus_mode.as_str(), "flood");
+        assert_eq!(opts.mtu, 1400);
+        assert_eq!(opts.mesh_links, 3);
+        assert_eq!(opts.relay_limit_kib, 2048);
+        assert_eq!(opts.topology.as_str(), "partial");
+        assert_eq!(
+            opts.metrics_addr.expect("persisted address").to_string(),
+            "127.0.0.1:9090"
+        );
+    }
+
+    /// A config file beats what was saved, and only for the keys it names.
+    #[test]
+    fn run_file_wins_over_the_persisted_values() {
+        let cfg: RunConfig = serde_json::from_str(
+            r#"{"no-relay": false, "relay-limit-kib": 0, "no-metrics": true, "mtu": 1300}"#,
+        )
+        .expect("valid config");
+        let opts = run_options_for_existing(&saved_network(), &cfg).expect("valid settings");
+        assert!(opts.use_relay, "no-relay:false re-enables the relay");
+        assert_eq!(opts.relay_limit_kib, 0);
+        assert!(opts.metrics_addr.is_none(), "no-metrics wins");
+        assert_eq!(opts.mtu, 1300);
+        // Keys the file is silent about still come from network.json.
+        assert_eq!(opts.bus_mode.as_str(), "flood");
+        assert!(!opts.use_mdns);
+    }
+
+    /// A `network.json` written before these settings existed has to keep
+    /// loading, and its missing keys fall through to the engine defaults.
+    #[test]
+    fn run_handles_a_network_json_from_an_older_version() {
+        let mut net = saved_network();
+        net.mtu = None;
+        net.use_relay = None;
+        net.use_mdns = None;
+        net.bus = None;
+        net.topology = None;
+        net.mesh_links = None;
+
+        let engine = RunOptions::default();
+        let opts = run_options_for_existing(&net, &RunConfig::default()).expect("valid settings");
+        assert_eq!(opts.mtu, engine.mtu);
+        assert_eq!(opts.use_relay, engine.use_relay);
+        assert_eq!(opts.use_mdns, engine.use_mdns);
+        assert_eq!(opts.bus_mode, engine.bus_mode);
+        assert_eq!(opts.mesh_links, engine.mesh_links);
+        assert_eq!(opts.topology, engine.topology);
+    }
+
+    /// The new fields are `skip_serializing_if = "Option::is_none"`, so old
+    /// state files (which lack them entirely) deserialize to `None`.
+    #[test]
+    fn network_json_round_trips_and_tolerates_the_old_shape() {
+        let mut value = serde_json::to_value(saved_network()).expect("serializable");
+        let obj = value.as_object_mut().expect("object");
+        for key in ["mtu", "use_relay", "use_mdns", "bus"] {
+            assert!(obj.remove(key).is_some(), "{key} should be persisted");
+        }
+        let old: NetworkConfig = serde_json::from_value(value).expect("old state still loads");
+        assert!(old.mtu.is_none());
+        assert!(old.use_relay.is_none());
+        assert!(old.use_mdns.is_none());
+        assert!(old.bus.is_none());
+    }
 
     #[test]
     fn byte_counts_are_human_readable() {
@@ -549,7 +691,7 @@ mod tests {
         for argv in [
             vec!["irohlan", "create", "--no-relay"],
             vec!["irohlan", "create", "--relay-limit-kib", "2048"],
-            vec!["irohlan", "create", "--subnet", "10.42.0.0/24"],
+            vec!["irohlan", "create", "--subnet", "10.13.37.0/24"],
             vec!["irohlan", "join", "--ip", "10.13.37.7"],
             vec!["irohlan", "run", "--metrics-addr", "127.0.0.1:9090"],
             vec!["irohlan", "run", "--no-metrics"],

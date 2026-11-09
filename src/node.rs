@@ -210,6 +210,13 @@ pub async fn create_network(
         mesh_links: Some(opts.mesh_links as u32),
         relay_limit_kib: Some(opts.relay_limit_kib),
         metrics_addr: opts.metrics_addr.map(|a| a.to_string()),
+        // Persist the data-plane settings too: `run` restores them, so a node
+        // created for an isolated network (no relay, flood bus) must not come
+        // back with the public relay re-enabled after a reboot.
+        mtu: Some(opts.mtu),
+        use_relay: Some(opts.use_relay),
+        use_mdns: Some(opts.use_mdns),
+        bus: Some(opts.bus_mode.as_str().to_string()),
     };
     state.save_network(&net)?;
     state.save_secret(&secret)?;
@@ -255,6 +262,13 @@ pub async fn join_network(
         mesh_links: Some(opts.mesh_links as u32),
         relay_limit_kib: Some(opts.relay_limit_kib),
         metrics_addr: opts.metrics_addr.map(|a| a.to_string()),
+        // Persist the data-plane settings too: `run` restores them, so a node
+        // created for an isolated network (no relay, flood bus) must not come
+        // back with the public relay re-enabled after a reboot.
+        mtu: Some(opts.mtu),
+        use_relay: Some(opts.use_relay),
+        use_mdns: Some(opts.use_mdns),
+        bus: Some(opts.bus_mode.as_str().to_string()),
     };
     state.save_network(&net)?;
     state.save_secret(&secret)?;

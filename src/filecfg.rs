@@ -15,7 +15,7 @@
 //!
 //! ```json
 //! {
-//!   "subnet": "10.42.0.0/24",
+//!   "subnet": "10.13.37.0/24",
 //!   "secret": "correct horse battery staple",
 //!   "dev": "irohlan0",
 //!   "no-relay": true,
@@ -36,16 +36,14 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use crate::bus::BusMode;
 use crate::netaddr::DEFAULT_V4_CIDR;
 use crate::node::Topology;
 use crate::tap::DEFAULT_MTU;
 
-/// Default broadcast bus, kept in one place so no struct can drift.
-///
-/// `BusMode` exposes no canonical name, so the literal lives here and
-/// `defaults_match_the_engine` proves it still parses to the engine default.
+/// Default broadcast bus, taken from the engine so the two cannot diverge.
 fn default_bus() -> String {
-    "gossip".to_string()
+    BusMode::default().as_str().to_string()
 }
 
 /// Default topology name, taken from the engine so the two cannot diverge.
@@ -178,22 +176,23 @@ impl Default for JoinConfig {
 
 /// Settings a `run` invocation reads.
 ///
-/// The override-style keys (`dev`, `topology`, `mesh-links`, `relay-limit-kib`,
-/// `metrics-addr`) stay `Option`al: leaving them out means "use whatever
-/// `network.json` persisted", not "reset to the built-in default".
-#[derive(Debug, Deserialize)]
+/// Everything here is an override. A key left out means "use whatever
+/// `network.json` persisted" (`create`/`join` store the MTU, relay, mDNS and
+/// bus choices too), and only a network saved by an older version — which has
+/// none of them — falls through to the built-in default.
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", default)]
 pub struct RunConfig {
     /// TAP device name override.
     pub dev: Option<String>,
     /// TAP MTU override (IPv6 requires at least 1280).
-    pub mtu: u16,
+    pub mtu: Option<u16>,
     /// Disable the public iroh relay infrastructure.
-    pub no_relay: bool,
+    pub no_relay: Option<bool>,
     /// Disable LAN mDNS discovery.
-    pub no_mdns: bool,
+    pub no_mdns: Option<bool>,
     /// Broadcast bus implementation: `gossip` or `flood`.
-    pub bus: String,
+    pub bus: Option<String>,
     /// Mesh topology override (defaults to the persisted choice).
     pub topology: Option<String>,
     /// Target neighbor count override (defaults to the persisted choice).
@@ -204,23 +203,6 @@ pub struct RunConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Disable the metrics endpoint for this run (ignores the persisted value).
     pub no_metrics: bool,
-}
-
-impl Default for RunConfig {
-    fn default() -> Self {
-        Self {
-            dev: None,
-            mtu: DEFAULT_MTU,
-            no_relay: false,
-            no_mdns: false,
-            bus: default_bus(),
-            topology: None,
-            mesh_links: None,
-            relay_limit_kib: None,
-            metrics_addr: None,
-            no_metrics: false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -240,7 +222,7 @@ mod tests {
     fn create_config_uses_the_old_flag_names() {
         let cfg: CreateConfig = parse(
             r#"{
-                "subnet": "10.42.0.0/24",
+                "subnet": "10.13.37.0/24",
                 "no-relay": true,
                 "no-ipv6": true,
                 "mesh-links": 4,
@@ -249,7 +231,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(cfg.subnet, "10.42.0.0/24");
+        assert_eq!(cfg.subnet, "10.13.37.0/24");
         assert!(cfg.no_relay);
         assert!(cfg.no_ipv6);
         assert_eq!(cfg.mesh_links, 4);
@@ -275,9 +257,9 @@ mod tests {
     fn keys_belonging_to_another_subcommand_are_rejected() {
         // `ip` is a join-only setting; accepting it in a create file would
         // mean silently ignoring what the operator asked for.
-        let err = parse::<CreateConfig>(r#"{"ip": "10.42.0.7"}"#).unwrap_err();
+        let err = parse::<CreateConfig>(r#"{"ip": "10.13.37.7"}"#).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
-        let err = parse::<RunConfig>(r#"{"subnet": "10.42.0.0/24"}"#).unwrap_err();
+        let err = parse::<RunConfig>(r#"{"subnet": "10.13.37.0/24"}"#).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
         let err = parse::<JoinConfig>(r#"{"subnet6": "fd00::/64"}"#).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
@@ -286,19 +268,23 @@ mod tests {
     #[test]
     fn join_config_accepts_a_ticket() {
         let cfg: JoinConfig =
-            parse(r#"{"ticket": "irohlan1_abc", "ip": "10.42.0.7", "ip6": "fd00::7"}"#).unwrap();
+            parse(r#"{"ticket": "irohlan1_abc", "ip": "10.13.37.7", "ip6": "fd00::7"}"#).unwrap();
         assert_eq!(cfg.ticket.as_deref(), Some("irohlan1_abc"));
-        assert_eq!(cfg.ip.unwrap().to_string(), "10.42.0.7");
+        assert_eq!(cfg.ip.unwrap().to_string(), "10.13.37.7");
         assert!(cfg.ip6.is_some());
     }
 
     #[test]
     fn empty_object_keeps_every_default() {
         let cfg: RunConfig = parse("{}").unwrap();
+        // Every `run` key is an override: unset means "keep what network.json
+        // stored", never "reset to the built-in default".
         assert!(cfg.dev.is_none());
-        assert!(!cfg.no_relay);
+        assert!(cfg.mtu.is_none());
+        assert!(cfg.no_relay.is_none());
+        assert!(cfg.no_mdns.is_none());
+        assert!(cfg.bus.is_none());
         assert!(cfg.metrics_addr.is_none());
-        // Overrides stay unset so `run` can fall back to the persisted values.
         assert!(cfg.topology.is_none());
         assert!(cfg.mesh_links.is_none());
         assert!(cfg.relay_limit_kib.is_none());
@@ -328,6 +314,47 @@ mod tests {
         assert_eq!(BusMode::parse(&cfg.bus).unwrap(), engine.bus_mode);
         assert_eq!(cfg.subnet, DEFAULT_V4_CIDR);
         assert!(cfg.subnet6.is_none());
+    }
+
+    /// The examples in the repo root are copy-paste material. A renamed key
+    /// would otherwise only be noticed by whoever copied the broken file.
+    #[test]
+    fn shipped_examples_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let create: CreateConfig = super::load(&root.join("create.example.json")).unwrap();
+        // No `secret` on purpose: the creator generates one and prints it.
+        assert!(create.secret.is_none());
+        assert_eq!(create.subnet, "10.13.37.0/24");
+        // Ship the engine defaults, not bench-tuning: an example that quietly
+        // lowers the MTU (1400) or turns on relay shaping (2048) changes the
+        // data plane for everyone who copies it.
+        assert_eq!(create.mtu, DEFAULT_MTU);
+        assert_eq!(create.relay_limit_kib, 0);
+
+        let join: JoinConfig = super::load(&root.join("join.example.json")).unwrap();
+        // No `ticket` on purpose: it is passed as the positional argument.
+        assert!(join.ticket.is_none());
+        // The examples are a matched pair: `ip` sits in the subnet `create`
+        // pins, `ip6` in the prefix it pins, and both name the same host
+        // index (7). Editing one file without the other breaks this, which is
+        // exactly what a copy-paste user would hit.
+        let ip = join.ip.expect("join example pins a v4 address");
+        let ip6 = join.ip6.expect("join example pins a v6 address");
+        assert_eq!(create.subnet6.as_deref(), Some("fd00:1234:5678::/64"));
+        assert_eq!(ip.octets()[..3], [10, 13, 37]);
+        assert_eq!(&ip6.segments()[..3], &[0xfd00, 0x1234, 0x5678]);
+        assert_eq!(ip.octets()[3], ip6.segments()[7] as u8);
+        assert_eq!(join.mtu, DEFAULT_MTU);
+        assert_eq!(join.relay_limit_kib, 0);
+
+        let run: RunConfig = super::load(&root.join("run.example.json")).unwrap();
+        assert_eq!(run.dev.as_deref(), Some("irohlan0"));
+        // `run` only shows an override: the cap persists in network.json, this
+        // file turns it off for one boot. Keys it omits keep the persisted
+        // value instead of a default.
+        assert_eq!(run.relay_limit_kib, Some(0));
+        assert!(run.topology.is_none());
     }
 
     /// The benchmark harness generates exactly these documents. Renaming a key
@@ -367,8 +394,10 @@ mod tests {
     fn missing_file_reports_its_path() {
         let err = load_or_default::<RunConfig>(Some(Path::new("does/not/exist.json"))).unwrap_err();
         assert!(err.to_string().contains("cannot read config file"), "{err}");
-        // No path at all is not an error: everything stays at its default.
+        // No path at all is not an error: `run` behaves as if the file were
+        // empty, i.e. it inherits everything from network.json.
         let cfg = load_or_default::<RunConfig>(None).unwrap();
-        assert_eq!(cfg.mtu, DEFAULT_MTU);
+        assert!(cfg.mtu.is_none());
+        assert!(cfg.no_relay.is_none());
     }
 }

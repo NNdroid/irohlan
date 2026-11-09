@@ -1,0 +1,8 @@
+{
+  "secret": "REPLACE-ME-WITH-THE-SECRET-PRINTED-BY-CREATE",
+  "ip": "10.13.37.7",
+  "ip6": "fd00:1234:5678::7",
+  "dev": "irohlan0",
+  "mtu": 1500,
+  "metrics-addr": "127.0.0.1:9090"
+}

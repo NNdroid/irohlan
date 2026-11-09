@@ -29,8 +29,9 @@ const FLOOD_DEDUP_CAP: usize = 8192;
 const EVENT_CAP: usize = 256;
 
 /// Which transport the bus uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BusMode {
+    #[default]
     Gossip,
     Flood,
 }
@@ -43,6 +44,14 @@ impl BusMode {
             other => Err(anyhow::anyhow!(
                 "unknown bus mode {other:?}, expected \"gossip\" or \"flood\""
             )),
+        }
+    }
+
+    /// Canonical lowercase name, used for persistence and config defaults.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Gossip => "gossip",
+            Self::Flood => "flood",
         }
     }
 }
