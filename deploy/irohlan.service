@@ -4,12 +4,14 @@
 #   1. Install the binary:       sudo cp target/x86_64-unknown-linux-gnu/release/irohlan /usr/local/bin/
 #   2. Allow TAP without root:   sudo setcap cap_net_admin+ep /usr/local/bin/irohlan
 #   3. Create/join once interactively (as your user):
-#        irohlan create            # or: irohlan join <ticket> --secret ...
+#        irohlan create            # or: irohlan join <ticket> --config member.json
 #   4. Enable the service:
 #        sudo systemctl enable --now irohlan@$USER
 #
 # The template instance runs `irohlan run` as the given user and reuses the
-# state under ~/.local/state/irohlan/ (XDG_STATE_HOME).
+# state under ~/.local/state/irohlan/ (XDG_STATE_HOME). Settings come from the
+# saved state, so no --config is needed; to override individual keys for this
+# service, point it at a file:  ExecStart=/usr/local/bin/irohlan run --config /etc/irohlan.json
 
 [Unit]
 Description=irohlan P2P layer-2 VPN node

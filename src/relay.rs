@@ -5,7 +5,7 @@
 //! Frames the local host originated, frames delivered to the local TAP and
 //! broadcast/multicast frames on the bus never touch the relay path.
 //!
-//! `--relay-limit-kib` stays a cap on this node's **total** forwarding rate,
+//! The `relay-limit-kib` setting stays a cap on this node's **total** forwarding rate,
 //! divided evenly between the currently active *source* peers (idle peers
 //! give their share back). Within each peer, frames are split into flows by
 //! the ordered five tuple (see [`crate::flow`]); each flow has its own FIFO,

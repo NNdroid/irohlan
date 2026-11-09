@@ -7,6 +7,7 @@ mod bus;
 mod cli;
 mod config;
 mod crypto;
+mod filecfg;
 mod flow;
 mod membership;
 mod mesh;
@@ -25,7 +26,10 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    let cli = <cli::Cli as clap::Parser>::parse();
+    // Everything configurable lives in a `--config` JSON file, so a single-stage
+    // parse is enough: there are no flag values to reconcile against the file.
+    use clap::Parser;
+    let cli = cli::Cli::parse();
     if let Err(err) = rt.block_on(cli::run(cli)) {
         eprintln!("error: {err:#}");
         std::process::exit(1);

@@ -88,7 +88,7 @@ impl Allocator {
     /// Grant (or confirm) a lease for `endpoint_id`.
     ///
     /// * `desired` — honored when free or already leased by the same endpoint.
-    ///   `--ip` and `--ip6` must resolve to the same host index.
+    ///   `ip` and `ip6` must resolve to the same host index.
     /// * Otherwise the lowest free index is granted.
     /// * If the endpoint already holds a lease, that lease is returned
     ///   unchanged (stable addressing across rejoin).

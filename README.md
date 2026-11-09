@@ -26,13 +26,13 @@ mDNS、网络邻居发现、局域网游戏等原生二层流量直接工作。�
   走完全相同的路径,NDP / MLD / DAD 的组播帧也照常经广播总线送达
 - **IPv4 / IPv6 双栈** —— 创建者按同一个 host index 分配两族地址并写入租约表;
   TAP 同时配置 v4/v6,默认 IPv6 前缀是从网络 id 派生的唯一 ULA /64;
-  `--no-ipv4` / `--no-ipv6` 可建纯单栈网络
+  配置文件里的 `no-ipv4` / `no-ipv6` 可建纯单栈网络
 - **iroh 数据面** —— QUIC datagram 直传(低延迟),超长帧自动走流兜底;
   公网经 n0 中继,局域网走 mDNS 直连(底层端点同时绑定 `0.0.0.0` 与 `[::]`,
   ticket 直连地址支持 IPv6)
 - **免学习转发** —— 虚拟 MAC 从节点公钥确定性派生(`02:xx:xx:...`),
   MAC ↔ 节点身份天然互查,成员表即寻址表
-- **Partial mesh(默认)** —— 每节点维持约 8 个邻居(`--mesh-links`),
+- **Partial mesh(默认)** —— 每节点维持约 8 个邻居(`mesh-links`),
   连接数 O(N·k) 而非 O(N²);单播帧按**链路质量加权**的链路状态路由(迷你 OSPF)
   多跳中继:代价综合 QUIC RTT、窗口丢包率、拥塞控制器估计带宽与链路饱和度,
   全部 EWMA 平滑并带切换迟滞防震荡
@@ -56,7 +56,7 @@ mDNS、网络邻居发现、局域网游戏等原生二层流量直接工作。�
 需要 Linux(内核 TUN/TAP 支持,且启用 IPv6)与 root 或 `CAP_NET_ADMIN`。
 
 ```bash
-# 机器 A(创建者)
+# 机器 A(创建者),不带 --config 即全部用默认值
 sudo ./irohlan create
 # 输出:
 #   addresses : 10.13.37.1, fdXX:XXXX:XXXX::1
@@ -64,8 +64,9 @@ sudo ./irohlan create
 #   network secret: ABCD2345...
 #   join ticket   : irohlan1_BBBB...
 
-# 机器 B(加入者)
-sudo ./irohlan join irohlan1_BBBB... --secret ABCD2345...
+# 机器 B(加入者):口令写进配置文件,省略则交互输入
+echo '{ "dev": "tap0", "secret": "ABCD2345..." }' > member.json
+sudo ./irohlan join irohlan1_BBBB... --config member.json
 
 # 回到机器 A / B,验证
 ping 10.13.37.2              # IPv4 互 ping
@@ -75,37 +76,94 @@ arp -i tap0                  # IPv4 ARP 表项
 ```
 
 两台机器在同一个局域网时,发现走 mDNS,完全离线可用;跨公网时经 n0 中继
-自动打洞(可用 `--no-relay` 关闭,配合自建 relay 使用)。
+自动打洞(配置文件里 `"no-relay": true` 可关闭,配合自建 relay 使用)。
 
 ## 命令
 
 | 命令 | 说明 |
 |---|---|
-| `irohlan create [--subnet 10.13.37.0/24] [--subnet6 fd00:1234::/64] [--no-ipv4] [--no-ipv6] [--secret ...] [--dev irohlan0] [--mtu 1500] [--bus gossip\|flood] [--topology partial\|full] [--mesh-links 8] [--relay-limit-kib 2048] [--metrics-addr 127.0.0.1:9090] [--no-relay] [--no-mdns]` | 创建网络并常驻运行;打印 join ticket。默认 IPv4 /24 + 由 net_id 派生的 ULA /64 |
-| `irohlan join <ticket> [--secret ...] [--ip 10.13.37.5] [--ip6 fd00::5] [--relay-limit-kib 2048] [--metrics-addr 127.0.0.1:9090] [--dev/--mtu/--bus/--topology/...]` | 加入网络并常驻运行;地址族由 ticket 决定,`--ip`/`--ip6` 必须对应同一个 host index(地址尾部一致) |
-| `irohlan run [--dev/--mtu/--bus/--topology/--mesh-links/--relay-limit-kib/--metrics-addr/--no-metrics/...]` | 从本地已保存的状态恢复运行(开机自启用) |
+| `irohlan create [--config <PATH>]` | 创建网络并常驻运行,打印 join ticket 与网络口令。不带 `--config` 时全部用默认值(IPv4 /24 + 由 net_id 派生的 ULA /64) |
+| `irohlan join [<ticket>] [--config <PATH>]` | 加入网络并常驻运行。地址族由 ticket 决定;ticket 也可写在配置文件的 `ticket` 键里,口令用 `secret` 键给出,缺失时交互提示 |
+| `irohlan run [--config <PATH>]` | 从本地已保存的状态恢复运行(开机自启用),配置文件只用来覆盖个别设置 |
 | `irohlan show` | 重新打印本机保存的 join ticket |
 | `irohlan status` | 查看运行时状态(成员表/路由表/计数器),含 ipv4 / ipv6 / subnets、逐链路 RTT/丢包/吞吐/带宽、选中路径代价、中继配额、活跃流数与 CoDel 计数 |
 
-常用选项:`--no-ipv4` / `--no-ipv6` 切换单栈;`--subnet6` 自定义 IPv6 前缀
-(支持 /32~/96,主机位至少 32 位);`--no-relay` 禁用公共 relay(但 iroh 的
-`N0DisableRelay` 预设**仍会尝试 DNS/pkarr 地址发现**);完全无外网时,gossip
-总线仍需可用的 mDNS 才能按 EndpointId 拨号,而 `--bus flood` 只沿已建立的 mesh
-连接泛洪,可彻底不依赖地址发现(离线/隔离网络推荐);`--no-mdns` 关闭局域网
-mDNS 发现;`-v/-vv` 提升日志级别。
-启用 IPv6 时 MTU 必须 ≥ 1280(RFC 8200 的链路 MTU 下限),否则启动报错;
-默认 1500。纯 IPv4 网络可以用更小的 MTU。
+`-v` / `-vv` 提升日志级别(全局参数,与配置文件无关)。
 
-`--relay-limit-kib N` 把本机**转发**的中继总流量限制为 N KiB/s(按字节计,
+### 配置文件(`--config`)
+
+**所有可调项都写在 JSON 配置文件里**,命令行只留 `--config`。这样既不用记住十几个
+flag,也不会出现"CLI 默认值和引擎默认值各写一遍、改一处漏一处"的问题;CI、批量
+部署、把节点模板纳入版本控制时尤其省事:
+
+```json
+{
+  "subnet": "10.42.0.0/24",
+  "secret": "correct horse battery staple",
+  "dev": "irohlan0",
+  "mtu": 1400,
+  "no-relay": true,
+  "bus": "flood",
+  "topology": "partial",
+  "mesh-links": 4,
+  "relay-limit-kib": 2048,
+  "metrics-addr": "127.0.0.1:9090"
+}
+```
+
+```bash
+irohlan create --config node.json
+irohlan join irohlan1_BBBB... --config node.json    # ticket 也可以写在文件里
+irohlan run --config node.json                      # 只覆盖想改的那几项
+```
+
+| 子命令 | 可用的键(全部可选) |
+|---|---|
+| `create` | `subnet` `subnet6` `no-ipv4` `no-ipv6` `secret` `dev` `mtu` `no-relay` `no-mdns` `bus` `topology` `mesh-links` `relay-limit-kib` `metrics-addr` |
+| `join` | `ticket` `secret` `ip` `ip6` `dev` `mtu` `no-relay` `no-mdns` `bus` `topology` `mesh-links` `relay-limit-kib` `metrics-addr` |
+| `run` | `dev` `mtu` `no-relay` `no-mdns` `bus` `topology` `mesh-links` `relay-limit-kib` `metrics-addr` `no-metrics` |
+
+`irohlan <子命令> --help` 会把上面这些键连同一个完整示例打印出来,不用翻文档。
+
+规则:
+
+- **键名 = 历史长参数的 kebab-case 形式**(`--relay-limit-kib` → `"relay-limit-kib"`,
+  `--no-relay` → `"no-relay"`),老 runbook / issue 里的写法仍然对得上。
+- **每个键都可省略**,省略即用内置默认值;**唯一的例外是 `run`**:`dev` /
+  `topology` / `mesh-links` / `relay-limit-kib` / `metrics-addr` 省略时回落到
+  `network.json` 里的持久化值,而不是重置成默认值。优先级为
+  **配置文件 > network.json > 内置默认**。
+- **未知键直接报错**,不会静默忽略 —— 报错信息会列出该子命令支持的全部键,
+  `"relay-limit-kibs"` 这类拼写错误不会悄悄回退成默认值。
+- **命令行不再接受这些参数**:`irohlan create --no-relay` 会报
+  `unexpected argument`。搬到文件里是一次性动作,之后改一项就是改一行 JSON。
+- 文件是**只读输入**,绝不回写:`create`/`join` 仍把结果持久化到 `network.json`,
+  `run` 也不会因为用了配置文件而改写已保存的参数。
+- 文件里可能含 `secret`,记得 `chmod 600 node.json`。
+
+### 设置说明
+
+**地址与 MTU** —— `subnet6` 自定义 IPv6 前缀(支持 /32~/96,主机位至少 32 位);
+`no-ipv4` / `no-ipv6` 建纯单栈网络。启用 IPv6 时 `mtu` 必须 ≥ 1280(RFC 8200 的
+链路 MTU 下限),否则启动报错;默认 1500,纯 IPv4 网络可以用更小的值。
+
+**发现与中继** —— `no-relay` 禁用公共 relay(但 iroh 的 `N0DisableRelay` 预设
+**仍会尝试 DNS/pkarr 地址发现**);完全无外网时,gossip 总线仍需可用的 mDNS 才能
+按 EndpointId 拨号,而 `"bus": "flood"` 只沿已建立的 mesh 连接泛洪,可彻底不依赖
+地址发现(离线/隔离网络推荐);`no-mdns` 关闭局域网 mDNS 发现。
+`topology` 取 `partial`(默认,每节点约 `mesh-links` 个邻居)或 `full`。
+
+**`relay-limit-kib N`** 把本机**转发**的中继总流量限制为 N KiB/s(按字节计,
 0 = 默认,只记账、不排队也不丢帧)。这个 N 是**总量**,由当前活跃的来源 peer
 均分(空闲 5 秒后释放份额),不会随邻居数线性放大。超限帧按五元组排进各自的
 flow 队列:每条流上限 64 帧 / 128 KiB(一个 peer 合计 512 帧 / 512 KiB 兜底),
 排队超过 2 秒丢弃;持续积压超过 5ms 且满 100ms 时,该流的 CoDel 会主动丢帧
 压低时延,让对端 TCP 提前降速。配置写入 `network.json`,`irohlan run` 重启后
-仍生效,也可用 `run --relay-limit-kib 0` 临时覆盖。它只作用于「从邻居收到、
-再转给下一跳」的单播帧:本机自己发出或发给本机自己的流量、广播/组播帧都不受限。
+仍生效,也可在 `run` 的配置文件里写 `"relay-limit-kib": 0` 临时关闭。它只作用于
+「从邻居收到、再转给下一跳」的单播帧:本机自己发出或发给本机自己的流量、
+广播/组播帧都不受限。
 
-`--metrics-addr 127.0.0.1:9090` 在本机回环开一个极简 HTTP 端点,
+**`metrics-addr`** 在本机回环开一个极简 HTTP 端点,
 `curl http://127.0.0.1:9090/metrics` 即可抓 Prometheus 文本格式指标:
 relay 全局/逐 peer 累计计数、队列积压、逐链路 RTT / 丢包率 / 吞吐 / 带宽估计,
 以及每条选中路径的加权代价。**只接受回环地址**(非 loopback 会直接报错、拒绝绑定),
@@ -113,9 +171,9 @@ relay 全局/逐 peer 累计计数、队列积压、逐链路 RTT / 丢包率 / 
 都会把同一份指标写到状态目录的 `metrics.prom`,可直接交给 node_exporter 的
 textfile collector。中继的**累计**帧数/字节数同时写入 `relay-ledger.json`
 (临时文件 + rename 原子替换),启动时读回并累加,重启不再归零;瞬时状态
-(队列积压、活跃 peer/flow)不持久化。`--metrics-addr` 会写进 `network.json`,
-`irohlan run` 默认继承,本次临时关闭用 `run --no-metrics`,临时换端口用
-`run --metrics-addr 127.0.0.1:9101`。
+(队列积压、活跃 peer/flow)不持久化。`metrics-addr` 会写进 `network.json`,
+`irohlan run` 默认继承;本次临时关闭用 `"no-metrics": true`,临时换端口用
+`"metrics-addr": "127.0.0.1:9101"`。
 
 ## 权限与部署
 
@@ -185,7 +243,7 @@ sudo systemctl enable --now irohlan@$USER
    (20s 公告,60s 过期)。
 6. **连接管理**:partial 模式下每节点自主拨号约 `k/2` 个邻居、接受约 `k/2` 个
    入连接(期望总度数 ≈ k);创建者作为锚点始终保留直连。掉线由拨号循环自动
-   补位(随机重选邻居),断链后路由随 LSA 刷新自动收敛。`--topology full` 可
+   补位(随机重选邻居),断链后路由随 LSA 刷新自动收敛。配置里写 `"topology": "full"` 可
    退回全互联(每对节点直连,小网络下两者等价)。
 7. **双栈地址计划**:网络由一个可选 IPv4 子网 + 一个可选 IPv6 前缀组成,地址族
    可独立开关。默认 IPv6 前缀 = `fd00::/8` + `blake3(net_id)` 的前 40 位 + 16 位
@@ -201,7 +259,7 @@ sudo systemctl enable --now irohlan@$USER
    主动丢弃)的帧数与字节数——注意 `in` 的归属是**上一跳**而不是原始发送者,
    因为二层帧里没有源节点身份。账本始终开启(默认就只记账),限速是可选的
    总量控制,分几层:
-   - **均分配额**:`--relay-limit-kib N` 定义本机总转发速率,由「活跃来源 peer」
+   - **均分配额**:`relay-limit-kib: N` 定义本机总转发速率,由「活跃来源 peer」
      (有积压或 5 秒内有帧)均分为 `N/k`;每个 peer 一个独立令牌桶(整数定点,
      不丢小数令牌,容量至少容纳一个最大帧)。重算份额前先把所有桶 refill 到
      当前时刻,避免切速率时丢掉已累积的时间;空闲 peer 退出后份额自动回吐,
@@ -229,7 +287,7 @@ sudo systemctl enable --now irohlan@$USER
      丢弃计入 `codel`。其中只有「队列满」是在 switch 当场丢弃、会同时计入
      `frames_dropped`,超时与 CoDel 都发生在 `drain()` 内部。队列为空且令牌够时
      `submit()` 走 fast path 立即发送,不经过 drain tick;
-     `--relay-limit-kib 0` 时所有帧都走这条路径。
+     `"relay-limit-kib": 0` 时所有帧都走这条路径。
 
   `drain()` 只返回待发帧,由 node 的 pump 负责真正调用 mesh,因此调度逻辑
   是纯数据、可确定性单测。账本的**累计**部分每 5 秒以及 Ctrl-C 退出时写入
@@ -262,11 +320,14 @@ relay:   ns-a (tap-a) ── veth ── ns-b (tap-b) ── veth ── ns-c (t
                                     └─ 创建者/中继,固定 10.13.37.1
 ```
 
-relay 模式里 a 与 c **没有 IP 路由直连**,且所有节点带 `--no-relay`,所以 a→c 的帧
-必然经 b 转发,能真正压到按对端配额、flow 队列、DRR 与 CoDel。netem 施加在每个
+relay 模式里 a 与 c **没有 IP 路由直连**,且每个节点的配置里都有
+`"no-relay": true`,所以 a→c 的帧必然经 b 转发,能真正压到按对端配额、flow 队列、DRR 与 CoDel。netem 施加在每个
 veth endpoint 的 egress qdisc 上,劣化的是 QUIC underlay 而不是 TAP 帧本身。
 
-⚠ **harness 固定用 `--bus flood`,不要用默认的 gossip**:join ticket 只携带
+harness 给每个节点生成一份 JSON 配置(`<bench-root>/state/config/<node>.json`),
+再用 `create --config` / `join <ticket> --config` 启动 —— 命令行已经没有这些 flag。
+
+⚠ **harness 固定用 `"bus": "flood"`,不要用默认的 gossip**:join ticket 只携带
 创建者的直接地址,而 gossip 要按裸 `EndpointId` 拨号,必须依赖地址发现。隔离
 netns 里没有 DNS、没有默认路由,mDNS 也因为「找不到默认接口」无法加入多播组
 (`could not join multicast group ... No such device`),所以 `gossip dial failed:
@@ -275,7 +336,7 @@ timed out` 会反复出现。后果不是 QUIC 断链 —— `connected_peers`�
 成员 TTL(60 秒)一到就被清掉,`by_mac()` 找不到对端,`ping` 变成
 `Destination Host Unreachable`、`iperf3` 变成 `No route to host`。flood 把广播
 封装成 `(origin, seq)` 信封沿**已建立的 mesh 连接**泛洪,不需要地址发现;relay
-拓扑另外用 `--mesh-links 1`,让 partial-mesh dialer 不再尝试拨没有地址的 c。
+拓扑另外把 `mesh-links` 设为 1,让 partial-mesh dialer 不再尝试拨没有地址的 c。
 mDNS 保持开启但不在关键路径上,它和 pkarr/DNS 超时只是预期日志噪声。
 
 第三次 CI 复验又暴露出更底层的 **mesh 单向传输问题**:flood 已经能把创建者的
@@ -289,7 +350,7 @@ mDNS 保持开启但不在关键路径上,它和 pkarr/DNS 超时只是预期日
 并为「零订阅者」「入站通道拒绝」「发送失败」加上可见日志,harness 运行时
 `RUST_LOG=info,irohlan=debug` 会把它们收进节点日志。
 
-> 排障顺序(CI 三次报红):第一次误判 `--no-mdns`;打开 mDNS 后第二次仍失败,
+> 排障顺序(CI 三次报红):第一次误判 mDNS 是元凶;打开 mDNS 后第二次仍失败,
 > 由 `frames_to_tap` 停滞 + `member expired` + `gossip dial failed` 定位到总线;
 > 换成 flood 后第三次发现「创建者能发不能收」,才下沉到 mesh 传输层。
 
@@ -400,18 +461,19 @@ ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mo
 # 3. 组播/mDNS:两侧安装 avahi-daemon,avahi-browse -a 应看到对方
 # 4. 广播:arping -I tap0 <对方IP>;观察 status 中 frames_from_tap 增长
 # 5. 重连:断开对端网络 30s 再恢复,观察 "mesh connected" 日志
-# 6. 冲突:两个节点用相同 --ip 加入,后者应被创建者拒绝
+# 6. 冲突:两个节点用相同的 `ip` 加入,后者应被创建者拒绝
 # 7. 多跳中继(partial mesh):3+ 节点组网,在 status 中确认
-#    peers 数约等于 --mesh-links;两台互不相邻的机器互 ping,
+#    peers 数约等于 `mesh-links`;两台互不相邻的机器互 ping,
 #    中间节点的 frames_relayed 计数应增长
-# 8. 拓扑对比:--topology full 重跑小规模场景,比较延迟/吞吐
+# 8. 拓扑对比:配置写 "topology": "full" 重跑小规模场景,比较延迟/吞吐
 # 9. IPv6:`ip -6 addr show dev tap0` 看到 ULA 地址;`ping6 <对端 v6>` 通;
 #    `ip -6 neigh show dev tap0` 能看到对端(NDP 走广播总线)
 # 10. IPv6 吞吐:`iperf3 -s -6` / `iperf3 -6 -c <对端 v6>`
-# 11. 纯单栈:`create --no-ipv4` 后确认 tap0 只有 v6 地址且 ping6 通;
-#     `create --no-ipv6` 后确认只有 v4 地址
-# 12. MTU 保护:带 IPv6 时 `--mtu 1200` 应被拒绝;`--no-ipv6 --mtu 1200` 可启动
-# 13. 自定义前缀:`create --subnet6 fd00:1234:5678::/64` 后 join,
+# 11. 纯单栈:配置写 "no-ipv4": true 后确认 tap0 只有 v6 地址且 ping6 通;
+#     写 "no-ipv6": true 后确认只有 v4 地址
+# 12. MTU 保护:带 IPv6 时 "mtu": 1200 应被拒绝;
+#     "no-ipv6": true 配 "mtu": 1200 可启动
+# 13. 自定义前缀:配置写 "subnet6": "fd00:1234:5678::/64" 后 join,
 #     两端地址都应落在该前缀内
 # 14. 链路质量观测:status 的 "links" 应列出直连邻居的 RTT(ms)、loss(‰)、
 #     tx/bw(kbps);"routes" 应列出到各目的地的 first hop 与加权代价;
@@ -419,24 +481,24 @@ ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mo
 # 15. 加权选路:3+ 节点组网,给某条链路人为加延迟(tc qdisc netem delay),
 #     观察 status 中该目的地的 first hop 是否切到低延迟路径;
 #     延迟回到原值后路径不应来回抖动(迟滞 10ms / 10%)
-# 16. LSA 容量:--mesh-links 保持默认 8;若调得极大,LSA 需保持在
+# 16. LSA 容量:`mesh-links` 保持默认 8;若调得极大,LSA 需保持在
 #     iroh-gossip 单条消息 4096 字节上限内(v5 约 80 条链路),
 #     flood 模式超限会自动改走 uni-stream
 # 17. 中继记账:3+ 节点 partial mesh,让两台非直连机器互 ping / iperf3,
 #     在中间节点 status 的 "relay peer" 里看到 in/out 帧数与字节数增长
 #     (归属是上一跳,不是原始发送者)
-# 18. 总量与均分:中间节点加 --relay-limit-kib 256,从**两个不同来源 peer**
+# 18. 总量与均分:中间节点配 "relay-limit-kib": 256,从**两个不同来源 peer**
 #     同时跑 iperf3;status 应显示 2 active peers、每 peer 128 KiB/s,
 #     两条流合计吞吐仍约 256 KiB/s(不是各 256),queued 计数随压测增长
 # 19. 公平性/防饿死:一边跑大包持续灌,另一边只发 ping/小包;小包流不应被
 #     饿死(DRR 轮转),同一来源的 TCP 流不应出现乱序重传告警;
 #     队列满或排队超时后 limited 增长,本机直连流量不受影响
 # 20. 持久化:限速节点改用 irohlan run 重启,status 的 limit 值应保持不变;
-#     run --relay-limit-kib 0 可临时关闭
+#     run 的配置写 "relay-limit-kib": 0 可临时关闭
 # 21. 按流公平:同一个来源 peer 上同时跑 1 条 iperf3 大象流和持续的
 #     ping / DNS 小包;status 的 active flows 应 >= 2,小包 RTT 不应随大象流
 #     灌入而飙升(有序五元组让 ACK/小包单独成流,DRR 单独服务)
-# 22. CoDel:把 --relay-limit-kib 调到明显低于发送速率并持续压测;
+# 22. CoDel:把 `relay-limit-kib` 调到明显低于发送速率并持续压测;
 #     status 的 codel 计数应增长,排队时延被压在 5ms~100ms 量级而不是
 #     一直涨到 2 秒 TTL;停止压测后 codel 计数应停止增长
 # 23. 链路质量:tc qdisc netem loss 5% 给某条链路注入丢包,status 的 links
@@ -445,10 +507,10 @@ ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mo
 # 24. 账本持久化:压一段中继流量后 Ctrl-C 停止,查看 relay-ledger.json 的
 #     累计值;irohlan run 重启后 status / metrics 的 relayed 总数应继续累加
 #     (不归零),queued 与 active_flows 则应从 0 开始
-# 25. Prometheus:create --metrics-addr 127.0.0.1:9090,
+# 25. Prometheus:配置写 "metrics-addr": "127.0.0.1:9090",
 #     curl http://127.0.0.1:9090/metrics 应看到 irohlan_relay_* /
 #     irohlan_link_* / irohlan_route_cost;其它路径返回 404;
-#     --metrics-addr 0.0.0.0:9090 应被拒绝;metrics.prom 与 HTTP 内容一致
+#     "metrics-addr": "0.0.0.0:9090" 应被拒绝;metrics.prom 与 HTTP 内容一致
 # 26. IPv6 扩展头:用 scapy 构造带 HBH / Destination Options 的 v6 流量,
 #     与同五元组的普通 v6 流对比,status 的 active flows 不应因扩展头翻倍;
 #     v6 分片下同一 datagram 的首片与后续片不应出现乱序重传
@@ -483,7 +545,7 @@ ARP/NDP 邻居表、多播组、最后一次 ping 输出写到 `_diagnostics/<mo
 - 广播走 gossip 时消息不保证送达(ARP/NDP/TCP 自带重试,可容忍);在完全没有
   地址发现的隔离网络里 gossip 拨号会持续超时,成员公告随之丢失,60 秒 TTL
   过期后即使 QUIC 连接仍在,`by_mac()` 也会查不到对端、单播被丢弃。这种环境
-  请显式用 `--bus flood`(见 Benchmark 章节)
+  请在配置文件里显式写 `"bus": "flood"`(见 Benchmark 章节)
 - 即便用 flood,**极端弱网 + 多跳中继**也会让 20 秒一次的成员公告被饿死:
   `mobile` 档(每跳 80ms±30ms / 3% 丢包 / 8mbit)叠加 2048 KiB/s 中继上限时,
   60 秒 TTL 过后 ARP 直接报 `Destination Host Unreachable`。缩小成员公告间隔或

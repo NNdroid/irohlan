@@ -238,7 +238,7 @@ impl AddrPlan {
         self.addrs(1)
     }
 
-    /// Resolve requested `--ip` / `--ip6` values to a single host index.
+    /// Resolve requested `ip` / `ip6` values to a single host index.
     /// When both are given they must describe the same host.
     pub fn offset_of(&self, desired: &VirtualAddrs) -> Result<Option<u32>, String> {
         let mut offset: Option<u32> = None;
@@ -287,7 +287,7 @@ impl AddrPlan {
             anyhow::ensure!(
                 mtu >= IPV6_MIN_MTU,
                 "IPv6 requires a link MTU of at least {IPV6_MIN_MTU} bytes (got {mtu}); \
-                 raise --mtu or use --no-ipv6"
+                 raise \"mtu\" or set \"no-ipv6\" in the config file"
             );
         }
         Ok(())

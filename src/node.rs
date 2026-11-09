@@ -134,7 +134,7 @@ pub struct RunOptions {
     pub use_mdns: bool,
     /// Broadcast bus implementation.
     pub bus_mode: BusMode,
-    /// Request specific virtual addresses when joining (`--ip` / `--ip6`).
+    /// Request specific virtual addresses when joining (`ip` / `ip6`).
     pub desired: VirtualAddrs,
     /// Mesh topology.
     pub topology: Topology,

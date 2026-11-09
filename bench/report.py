@@ -219,7 +219,7 @@ def analyze(root):
             if total_relayed == 0:
                 warnings.append(
                     "relay mode produced no relayed frames: A and C may have "
-                    "connected directly (check that --no-relay is active and "
+                    "connected directly (check that \"no-relay\" is set in every node's config and "
                     "that the veth topology has no A-C route). FQ/CoDel "
                     "numbers for this mode are not meaningful."
                 )
@@ -248,7 +248,7 @@ def analyze(root):
     if metrics_failures:
         warnings.append(
             f"{metrics_failures} loopback /metrics HTTP probe(s) failed; "
-            "check the node logs and --metrics-addr."
+            "check the node logs and the metrics-addr setting."
         )
     if rows and all(r["metrics_endpoints_ok"] == 0 for r in rows):
         warnings.append(

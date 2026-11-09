@@ -261,6 +261,66 @@ bench_cleanup() {
 trap bench_cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------------------
+# Node settings
+# ---------------------------------------------------------------------------
+# The CLI accepts nothing but `--config`, so every knob the harness needs
+# travels in a per-node JSON file: device name, secret, MTU, relay cap,
+# topology/bus, the pinned address and (creator only) the subnet.
+bench_write_config() {
+    local path=$1 role=$2 node=$3 relay_limit=$4 ipv6=$5
+    mkdir -p "$(dirname "$path")"
+    {
+        printf '{\n'
+        printf '  "dev": "tap-%s",\n' "$node"
+        printf '  "secret": "%s",\n' "$BENCH_SECRET"
+        printf '  "mtu": %s,\n' "$BENCH_MTU"
+        # "no-relay" is mandatory for the linear topology: a public relay would
+        # let a and c connect directly and bypass the middle node entirely.
+        printf '  "no-relay": true,\n'
+        # "bus": "flood" is equally mandatory. The join ticket only carries the
+        # creator's direct addresses; iroh-gossip would have to dial every other
+        # peer by bare EndpointId, which needs an address lookup. An isolated
+        # netns has no DNS/default route and mDNS cannot join a multicast group
+        # on a nonexistent default interface, so those dials time out. Gossip
+        # then drops ARP/NDP broadcasts and the 20s membership announcements,
+        # the 60s member TTL expires, and the L2 overlay goes dark even though
+        # the QUIC mesh is still connected. Flood sends envelopes over the
+        # already-established mesh links (with (origin, seq) dedup) and needs
+        # no lookup service at all.
+        #
+        # mDNS is left enabled but is NOT on the critical path: its send errors
+        # and the pkarr/DNS timeouts are expected noise in this topology.
+        # Our own crate logs at debug level so mesh send failures, dropped frames
+        # and bus delivery problems land in the collected node logs.
+        printf '  "bus": "flood",\n'
+        if [[ "$BENCH_MODE" == relay ]]; then
+            # One link per node keeps the partial-mesh dialer idle: a and c each
+            # already have the creator, so no bare-EndpointId dial is attempted.
+            # Higher values would make a try (and fail) to dial c.
+            printf '  "topology": "partial",\n'
+            printf '  "mesh-links": 1,\n'
+        else
+            # Direct mode is a two-node network that the ticket already wires
+            # up; full topology keeps the dialer out of the way.
+            printf '  "topology": "full",\n'
+        fi
+        printf '  "relay-limit-kib": %s,\n' "$relay_limit"
+        if [[ "$role" == create ]]; then
+            printf '  "subnet": "%s",\n' "$BENCH_V4_NET"
+            if [[ "$ipv6" != "1" ]]; then
+                printf '  "no-ipv6": true,\n'
+            fi
+        else
+            # Pin the virtual IPv4 so the harness knows every address up front.
+            # The creator derives the matching IPv6 from the same host index.
+            printf '  "ip": "%s",\n' "$(vip_of "$node")"
+        fi
+        printf '  "metrics-addr": "127.0.0.1:%s"\n' "$BENCH_METRICS_PORT"
+        printf '}\n'
+    } >"$path"
+}
+
+# ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
 bench_start_nodes() {
@@ -268,46 +328,13 @@ bench_start_nodes() {
     BENCH_IPV6=$ipv6
     local creator
     creator=$(bench_creator_node)
+    local cfgdir="$BENCH_STATE_ROOT/config"
 
-    # --no-relay is mandatory for the linear topology: a public relay would
-    # let a and c connect directly and bypass the middle node entirely.
-    #
-    # --bus flood is equally mandatory. The join ticket only carries the
-    # creator's direct addresses; iroh-gossip would have to dial every other
-    # peer by bare EndpointId, which needs an address lookup. An isolated
-    # netns has no DNS/default route and mDNS cannot join a multicast group
-    # on a nonexistent default interface, so those dials time out. Gossip
-    # then drops ARP/NDP broadcasts and the 20s membership announcements,
-    # the 60s member TTL expires, and the L2 overlay goes dark even though
-    # the QUIC mesh is still connected. Flood sends envelopes over the
-    # already-established mesh links (with (origin, seq) dedup) and needs
-    # no lookup service at all.
-    #
-    # mDNS is left enabled but is NOT on the critical path: its send errors
-    # and the pkarr/DNS timeouts are expected noise in this topology.
-    # Our own crate logs at debug level so mesh send failures, dropped frames
-    # and bus delivery problems land in the collected node logs.
-    local common=(--no-relay --bus flood --mtu "$BENCH_MTU"
-        --secret "$BENCH_SECRET"
-        --relay-limit-kib "$relay_limit"
-        --metrics-addr "127.0.0.1:$BENCH_METRICS_PORT")
-    if [[ "$BENCH_MODE" == relay ]]; then
-        # One link per node keeps the partial-mesh dialer idle: a and c each
-        # already have the creator, so no bare-EndpointId dial is attempted.
-        # Higher values would make a try (and fail) to dial c.
-        common+=(--topology partial --mesh-links 1)
-    else
-        common+=(--topology full)
-    fi
-
-    local creator_args=("${common[@]}" --subnet "$BENCH_V4_NET")
-    if [[ "$ipv6" != "1" ]]; then
-        creator_args+=(--no-ipv6)
-    fi
+    bench_write_config "$cfgdir/$creator.json" create "$creator" "$relay_limit" "$ipv6"
 
     ip netns exec "$(ns_of "$creator")" \
         env XDG_STATE_HOME="$BENCH_STATE_ROOT/$creator" RUST_LOG="info,irohlan=debug" \
-        "$BENCH_BINARY" create --dev "tap-$creator" "${creator_args[@]}" \
+        "$BENCH_BINARY" create --config "$cfgdir/$creator.json" \
         >"$BENCH_LOG_ROOT/$creator.log" 2>&1 &
     BENCH_PIDS+=("$!")
 
@@ -330,16 +357,14 @@ bench_start_nodes() {
         if [[ "$node" == "$creator" ]]; then
             continue
         fi
-        # Pin the virtual IPv4 so the harness knows every address up front.
-        # The creator derives the matching IPv6 from the same host index.
+        bench_write_config "$cfgdir/$node.json" join "$node" "$relay_limit" "$ipv6"
         ip netns exec "$(ns_of "$node")" \
             env XDG_STATE_HOME="$BENCH_STATE_ROOT/$node" RUST_LOG="info,irohlan=debug" \
-            "$BENCH_BINARY" join "$BENCH_TICKET" --ip "$(vip_of "$node")" \
-            --dev "tap-$node" "${common[@]}" \
+            "$BENCH_BINARY" join "$BENCH_TICKET" --config "$cfgdir/$node.json" \
             >"$BENCH_LOG_ROOT/$node.log" 2>&1 &
         BENCH_PIDS+=("$!")
     done
-    bench_log "nodes started (creator=$creator, ticket ${#BENCH_TICKET} chars, relay cap ${relay_limit} KiB/s, ipv6=$ipv6)"
+    bench_log "nodes started (creator=$creator, ticket ${#BENCH_TICKET} chars, relay cap ${relay_limit} KiB/s, ipv6=$ipv6, config=$cfgdir)"
 }
 
 # Read the assigned IPv6 address from a node's status.json. The ULA prefix is

@@ -41,7 +41,7 @@ pub struct NetworkConfig {
     /// Endpoint id of the creator; `None` when we are the creator.
     pub creator: Option<IdBytes>,
     pub is_creator: bool,
-    /// Our pinned virtual addresses, if set via `--ip` / `--ip6`.
+    /// Our pinned virtual addresses, if set via the `ip` / `ip6` keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_ip: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

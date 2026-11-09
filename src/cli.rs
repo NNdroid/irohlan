@@ -1,15 +1,46 @@
 //! Command line interface.
+//!
+//! The surface is intentionally tiny: every setting lives in the `--config`
+//! JSON file (see [`crate::filecfg`]), so the three long-running subcommands
+//! take nothing but a path. Adding a knob used to mean touching `cli.rs`, its
+//! tests and the README; now it is one field plus one `Default` line.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
 use crate::bus::BusMode;
 use crate::config::{StateDir, StatusReport};
-use crate::netaddr::{VirtualAddrs, DEFAULT_V4_CIDR};
+use crate::filecfg;
+use crate::netaddr::VirtualAddrs;
 use crate::node::{self, NetworkSpec, RunOptions, V6Choice};
-use crate::tap::DEFAULT_MTU;
 use crate::ticket::JoinTicket;
+
+/// Keys `create` accepts in its config file.
+const CREATE_KEYS: &str = "Config keys (all optional):
+  subnet, subnet6, no-ipv4, no-ipv6, secret, dev, mtu, no-relay, no-mdns,
+  bus, topology, mesh-links, relay-limit-kib, metrics-addr
+
+Example:
+  {\"subnet\": \"10.42.0.0/24\", \"no-relay\": true, \"relay-limit-kib\": 2048,
+   \"metrics-addr\": \"127.0.0.1:9090\"}";
+
+/// Keys `join` accepts in its config file.
+const JOIN_KEYS: &str = "Config keys (all optional):
+  ticket, secret, ip, ip6, dev, mtu, no-relay, no-mdns, bus, topology,
+  mesh-links, relay-limit-kib, metrics-addr
+
+The ticket may be given as the positional argument or as the \"ticket\" key.
+Without a secret the node prompts for one.";
+
+/// Keys `run` accepts in its config file.
+const RUN_KEYS: &str = "Config keys (all optional):
+  dev, mtu, no-relay, no-mdns, bus, topology, mesh-links, relay-limit-kib,
+  metrics-addr, no-metrics
+
+Everything else is restored from network.json; topology, mesh-links,
+relay-limit-kib and metrics-addr only override the persisted values.";
 
 #[derive(Parser)]
 #[command(
@@ -17,8 +48,12 @@ use crate::ticket::JoinTicket;
     version,
     about = "P2P Layer-2 VPN for Linux built on iroh — a dual-stack virtual ethernet LAN between your machines",
     after_help = "Typical flow:
-  machine A:  irohlan create
-  machine B:  irohlan join <ticket> --secret <network secret>"
+  machine A:  irohlan create --config creator.json
+  machine B:  irohlan join <ticket> --config member.json
+
+Every setting lives in the config file, named after the historic long flags
+(e.g. \"no-relay\": true, \"relay-limit-kib\": 2048). Run
+`irohlan <command> --help` for the keys each command accepts."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -31,124 +66,34 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Create a new virtual LAN; this node becomes the creator and address allocator
+    ///
+    /// Prints the join ticket and the network secret, then runs until stopped.
+    /// Omitting --config creates a network with all defaults.
+    #[command(after_help = CREATE_KEYS)]
     Create {
-        /// Virtual IPv4 subnet in CIDR notation
-        #[arg(long, default_value = DEFAULT_V4_CIDR)]
-        subnet: String,
-        /// Virtual IPv6 prefix in CIDR notation (default: ULA /64 derived from the network id)
-        #[arg(long)]
-        subnet6: Option<String>,
-        /// Disable the IPv4 address family
-        #[arg(long, default_value_t = false)]
-        no_ipv4: bool,
-        /// Disable the IPv6 address family
-        #[arg(long, default_value_t = false)]
-        no_ipv6: bool,
-        /// Network secret (generated and printed when omitted)
-        #[arg(long)]
-        secret: Option<String>,
-        /// TAP device name (e.g. irohlan0 or irohlan%d)
-        #[arg(long)]
-        dev: Option<String>,
-        /// TAP MTU (IPv6 requires at least 1280)
-        #[arg(long, default_value_t = DEFAULT_MTU)]
-        mtu: u16,
-        /// Disable the public iroh relay infrastructure
-        #[arg(long, default_value_t = false)]
-        no_relay: bool,
-        /// Disable LAN mDNS discovery
-        #[arg(long, default_value_t = false)]
-        no_mdns: bool,
-        /// Broadcast bus implementation: gossip or flood
-        #[arg(long, default_value = "gossip")]
-        bus: String,
-        /// Mesh topology: partial (k neighbors + multi-hop relay) or full
-        #[arg(long, default_value = "partial")]
-        topology: String,
-        /// Target neighbor count in partial topology
-        #[arg(long, default_value_t = 8)]
-        mesh_links: usize,
-        /// Cap forwarded (relayed) traffic in KiB/s; 0 keeps accounting only
-        #[arg(long, default_value_t = 0)]
-        relay_limit_kib: u32,
-        /// Loopback address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9090)
-        #[arg(long)]
-        metrics_addr: Option<SocketAddr>,
+        /// JSON settings file
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
     /// Join a virtual LAN using a join ticket from the creator
+    ///
+    /// The ticket comes from the positional argument or from the config file's
+    /// "ticket" key; the network secret is prompted for when not configured.
+    #[command(after_help = JOIN_KEYS)]
     Join {
         /// The join ticket printed by `irohlan create`
-        ticket: String,
-        /// Network secret (the creator printed it next to the ticket)
-        #[arg(long)]
-        secret: Option<String>,
-        /// Request this specific virtual IPv4 address
-        #[arg(long)]
-        ip: Option<Ipv4Addr>,
-        /// Request this specific virtual IPv6 address (must share the host index with --ip)
-        #[arg(long)]
-        ip6: Option<Ipv6Addr>,
-        /// TAP device name (e.g. irohlan0 or irohlan%d)
-        #[arg(long)]
-        dev: Option<String>,
-        /// TAP MTU (IPv6 requires at least 1280)
-        #[arg(long, default_value_t = DEFAULT_MTU)]
-        mtu: u16,
-        /// Disable the public iroh relay infrastructure
-        #[arg(long, default_value_t = false)]
-        no_relay: bool,
-        /// Disable LAN mDNS discovery
-        #[arg(long, default_value_t = false)]
-        no_mdns: bool,
-        /// Broadcast bus implementation: gossip or flood
-        #[arg(long, default_value = "gossip")]
-        bus: String,
-        /// Mesh topology: partial (k neighbors + multi-hop relay) or full
-        #[arg(long, default_value = "partial")]
-        topology: String,
-        /// Target neighbor count in partial topology
-        #[arg(long, default_value_t = 8)]
-        mesh_links: usize,
-        /// Cap forwarded (relayed) traffic in KiB/s; 0 keeps accounting only
-        #[arg(long, default_value_t = 0)]
-        relay_limit_kib: u32,
-        /// Loopback address for the Prometheus /metrics endpoint (e.g. 127.0.0.1:9090)
-        #[arg(long)]
-        metrics_addr: Option<SocketAddr>,
+        ticket: Option<String>,
+        /// JSON settings file
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
     /// Resume the previously created/joined network from local state
     /// (used with systemd or after a reboot)
+    #[command(after_help = RUN_KEYS)]
     Run {
-        /// TAP device name override
-        #[arg(long)]
-        dev: Option<String>,
-        /// TAP MTU override (IPv6 requires at least 1280)
-        #[arg(long)]
-        mtu: Option<u16>,
-        /// Disable the public iroh relay infrastructure
-        #[arg(long, default_value_t = false)]
-        no_relay: bool,
-        /// Disable LAN mDNS discovery
-        #[arg(long, default_value_t = false)]
-        no_mdns: bool,
-        /// Broadcast bus implementation: gossip or flood
-        #[arg(long, default_value = "gossip")]
-        bus: String,
-        /// Mesh topology override (defaults to the persisted choice)
-        #[arg(long)]
-        topology: Option<String>,
-        /// Target neighbor count override (defaults to the persisted choice)
-        #[arg(long)]
-        mesh_links: Option<usize>,
-        /// Relay cap override in KiB/s (defaults to the persisted value)
-        #[arg(long)]
-        relay_limit_kib: Option<u32>,
-        /// Loopback address override for the Prometheus /metrics endpoint
-        #[arg(long)]
-        metrics_addr: Option<SocketAddr>,
-        /// Disable the metrics endpoint for this run (ignores the persisted value)
-        #[arg(long, default_value_t = false)]
-        no_metrics: bool,
+        /// JSON settings file with overrides for this run
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
     /// Print the join ticket stored by a previous `create`
     Show,
@@ -156,6 +101,11 @@ pub enum Command {
     Status,
 }
 
+/// Assemble engine options from the settings three subcommands share.
+///
+/// `desired` addresses, the relay cap and the metrics address are set by each
+/// caller afterwards, because they differ per subcommand (`create`/`join` use
+/// the configured values, `run` falls back to the persisted ones).
 fn run_options(
     dev: Option<String>,
     mtu: u16,
@@ -174,9 +124,9 @@ fn run_options(
         desired: VirtualAddrs::default(),
         topology: node::Topology::parse(topology)?,
         mesh_links,
-        // Like `desired`, the relay cap and metrics address are set by each
-        // subcommand afterwards (create/join use the CLI value, run uses the
-        // persisted value).
+        // Like `desired`, the relay cap and the metrics address are set by each
+        // subcommand afterwards (create/join use the configured values, run
+        // falls back to the persisted ones).
         relay_limit_kib: 0,
         metrics_addr: None,
     })
@@ -232,7 +182,8 @@ fn init_tracing(verbose: u8) {
         .init();
 }
 
-/// Prompt for the secret on stdin (used by `join` without --secret).
+/// Prompt for the secret on stdin (used by `join` when the config file has no
+/// `secret` key).
 fn prompt_secret() -> anyhow::Result<String> {
     eprint!("network secret: ");
     use std::io::Write;
@@ -249,99 +200,92 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let state = StateDir::open()?;
 
     match cli.command {
-        Command::Create {
-            subnet,
-            subnet6,
-            no_ipv4,
-            no_ipv6,
-            secret,
-            dev,
-            mtu,
-            no_relay,
-            no_mdns,
-            bus,
-            topology,
-            mesh_links,
-            relay_limit_kib,
-            metrics_addr,
-        } => {
-            let spec = network_spec(subnet, subnet6, no_ipv4, no_ipv6);
-            let mut opts = run_options(dev, mtu, no_relay, no_mdns, &bus, &topology, mesh_links)?;
-            opts.relay_limit_kib = relay_limit_kib;
-            opts.metrics_addr = metrics_addr;
-            node::create_network(&state, spec, secret, opts).await
+        Command::Create { config } => {
+            let cfg = filecfg::load_or_default::<filecfg::CreateConfig>(config.as_deref())?;
+            let spec = network_spec(cfg.subnet, cfg.subnet6, cfg.no_ipv4, cfg.no_ipv6);
+            let mut opts = run_options(
+                cfg.dev,
+                cfg.mtu,
+                cfg.no_relay,
+                cfg.no_mdns,
+                &cfg.bus,
+                &cfg.topology,
+                cfg.mesh_links,
+            )?;
+            opts.relay_limit_kib = cfg.relay_limit_kib;
+            opts.metrics_addr = cfg.metrics_addr;
+            node::create_network(&state, spec, cfg.secret, opts).await
         }
-        Command::Join {
-            ticket,
-            secret,
-            ip,
-            ip6,
-            dev,
-            mtu,
-            no_relay,
-            no_mdns,
-            bus,
-            topology,
-            mesh_links,
-            relay_limit_kib,
-            metrics_addr,
-        } => {
-            let ticket = JoinTicket::decode(&ticket)
+        Command::Join { ticket, config } => {
+            let cfg = filecfg::load_or_default::<filecfg::JoinConfig>(config.as_deref())?;
+            let raw = ticket.or(cfg.ticket).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "join needs a ticket: pass it as an argument or set the \"ticket\" key in the config file"
+                )
+            })?;
+            let ticket = JoinTicket::decode(&raw)
                 .map_err(|e| anyhow::anyhow!("invalid join ticket: {e}"))?;
-            let secret = match secret {
-                Some(s) => s,
+            let secret = match cfg.secret {
+                Some(secret) => secret,
                 None => prompt_secret()?,
             };
             let mut opts = RunOptions {
                 desired: VirtualAddrs {
-                    v4: ip.map(u32::from),
-                    v6: ip6.map(|a| a.octets()),
+                    v4: cfg.ip.map(u32::from),
+                    v6: cfg.ip6.map(|a| a.octets()),
                 },
-                ..run_options(dev, mtu, no_relay, no_mdns, &bus, &topology, mesh_links)?
+                ..run_options(
+                    cfg.dev,
+                    cfg.mtu,
+                    cfg.no_relay,
+                    cfg.no_mdns,
+                    &cfg.bus,
+                    &cfg.topology,
+                    cfg.mesh_links,
+                )?
             };
-            opts.relay_limit_kib = relay_limit_kib;
-            opts.metrics_addr = metrics_addr;
+            opts.relay_limit_kib = cfg.relay_limit_kib;
+            opts.metrics_addr = cfg.metrics_addr;
             node::join_network(&state, &ticket, secret, opts).await
         }
-        Command::Run {
-            dev,
-            mtu,
-            no_relay,
-            no_mdns,
-            bus,
-            topology,
-            mesh_links,
-            relay_limit_kib,
-            metrics_addr,
-            no_metrics,
-        } => {
+        Command::Run { config } => {
+            let cfg = filecfg::load_or_default::<filecfg::RunConfig>(config.as_deref())?;
             let net = state.load_network()?;
             let secret = state.load_secret()?;
-            let persisted_topology = net.topology.clone().unwrap_or_else(|| "partial".into());
-            let persisted_links = net.mesh_links.map(|n| n as usize).unwrap_or(8);
+            // Precedence for the override-style settings:
+            // config file > network.json > built-in default.
+            let persisted_topology = net
+                .topology
+                .clone()
+                .unwrap_or_else(|| node::Topology::default().as_str().to_string());
+            let persisted_links = net
+                .mesh_links
+                .map(|n| n as usize)
+                .unwrap_or_else(|| RunOptions::default().mesh_links);
             let persisted_relay_limit = net.relay_limit_kib.unwrap_or(0);
             let persisted_metrics = net
                 .metrics_addr
                 .as_deref()
                 .and_then(|s| s.parse::<SocketAddr>().ok());
             let mut opts = run_options(
-                dev,
-                mtu.unwrap_or(DEFAULT_MTU),
-                no_relay,
-                no_mdns,
-                &bus,
-                topology.as_deref().unwrap_or(&persisted_topology),
-                mesh_links.unwrap_or(persisted_links),
+                cfg.dev,
+                cfg.mtu,
+                cfg.no_relay,
+                cfg.no_mdns,
+                &cfg.bus,
+                cfg.topology.as_deref().unwrap_or(&persisted_topology),
+                cfg.mesh_links.unwrap_or(persisted_links),
             )?;
             opts.desired = net.static_addrs();
-            opts.relay_limit_kib = relay_limit_kib.unwrap_or(persisted_relay_limit);
-            opts.metrics_addr = if no_metrics {
+            opts.relay_limit_kib = cfg.relay_limit_kib.unwrap_or(persisted_relay_limit);
+            opts.metrics_addr = if cfg.no_metrics {
                 None
             } else {
-                metrics_addr.or(persisted_metrics)
+                cfg.metrics_addr.or(persisted_metrics)
             };
             node::run_node(&state, net, secret, opts).await
         }
+
         Command::Show => {
             let ticket = state.load_ticket()?;
             println!("{}", ticket.encode()?);
@@ -466,7 +410,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_bytes;
+    use super::{format_bytes, Cli, Command};
+    use clap::{error::ErrorKind, CommandFactory, Parser};
 
     #[test]
     fn byte_counts_are_human_readable() {
@@ -476,5 +421,143 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KiB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    /// Every subcommand must take a config path and nothing else (`join` also
+    /// takes the ticket). A stray flag would mean a setting that only one code
+    /// path honours, which is exactly what moving everything into the file was
+    /// meant to prevent.
+    #[test]
+    fn subcommands_only_take_a_config_path() {
+        let cmd = Cli::command();
+        for sc in cmd.get_subcommands() {
+            let mut ids: Vec<&str> = sc
+                .get_arguments()
+                // `--verbose` is global, so clap propagates it everywhere.
+                .map(|a| a.get_id().as_str())
+                .filter(|id| *id != "verbose")
+                .collect();
+            ids.sort_unstable();
+            let mut expected: Vec<&str> = match sc.get_name() {
+                "create" | "run" => vec!["config"],
+                "join" => vec!["config", "ticket"],
+                "show" | "status" => vec![],
+                other => panic!("unexpected subcommand {other}"),
+            };
+            expected.sort_unstable();
+            assert_eq!(ids, expected, "{}", sc.get_name());
+        }
+    }
+
+    /// A bare command must work: `create` and `join` have real defaults, and
+    /// `run` restores everything from `network.json` — the systemd unit
+    /// depends on `ExecStart=irohlan run` staying valid.
+    #[test]
+    fn bare_commands_still_parse() {
+        for argv in [
+            vec!["irohlan", "create"],
+            vec!["irohlan", "run"],
+            vec!["irohlan", "join"],
+            vec!["irohlan", "show"],
+            vec!["irohlan", "status"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let _ = cli;
+        }
+    }
+
+    #[test]
+    fn config_path_and_ticket_are_parsed() {
+        let cli =
+            Cli::try_parse_from(["irohlan", "join", "irohlan1_x", "--config", "b.json"]).unwrap();
+        match cli.command {
+            Command::Join { ticket, config } => {
+                assert_eq!(ticket.as_deref(), Some("irohlan1_x"));
+                assert_eq!(config.unwrap().to_str(), Some("b.json"));
+            }
+            _ => panic!("expected join"),
+        }
+
+        let cli = Cli::try_parse_from(["irohlan", "run", "--config", "c.json"]).unwrap();
+        match cli.command {
+            Command::Run { config } => assert_eq!(config.unwrap().to_str(), Some("c.json")),
+            _ => panic!("expected run"),
+        }
+        let cli = Cli::try_parse_from(["irohlan", "run"]).unwrap();
+        match cli.command {
+            Command::Run { config } => assert!(config.is_none()),
+            _ => panic!("expected run"),
+        }
+    }
+
+    /// The key list printed by `--help` is hand-written, so it can drift from
+    /// the parser. serde's "unknown field" error enumerates the real fields,
+    /// which makes the two sets comparable.
+    #[test]
+    fn help_lists_exactly_the_accepted_keys() {
+        use super::{CREATE_KEYS, JOIN_KEYS, RUN_KEYS};
+        use crate::filecfg::{CreateConfig, JoinConfig, RunConfig};
+
+        /// Words in the `Config keys` block of a help string.
+        fn listed(help: &str) -> Vec<String> {
+            let block = help
+                .split("Config keys (all optional):")
+                .nth(1)
+                .expect("help has a key block")
+                .split("\n\n")
+                .next()
+                .expect("key block is not empty");
+            block
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Fields serde accepts, taken from the error for an unknown key.
+        fn accepted<T: serde::de::DeserializeOwned>() -> Vec<String> {
+            let err = match serde_json::from_str::<T>(r#"{"nope": null}"#) {
+                Ok(_) => panic!("an unknown key must be rejected"),
+                Err(err) => err.to_string(),
+            };
+            // "... expected one of `subnet`, `subnet6`, ... at line 1 column N"
+            err.split('`')
+                .skip(1)
+                .step_by(2)
+                .skip(1) // the bogus key we just sent
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn assert_same(help: &str, fields: Vec<String>, name: &str) {
+            let mut from_help = listed(help);
+            let mut from_serde = fields;
+            from_help.sort();
+            from_serde.sort();
+            assert_eq!(from_help, from_serde, "{name} help lists stale keys");
+        }
+
+        assert_same(CREATE_KEYS, accepted::<CreateConfig>(), "create");
+        assert_same(JOIN_KEYS, accepted::<JoinConfig>(), "join");
+        assert_same(RUN_KEYS, accepted::<RunConfig>(), "run");
+    }
+
+    /// The flags that moved into the config file must not creep back: silently
+    /// accepting one would mean the node ignores what the operator typed.
+    #[test]
+    fn settings_flags_are_gone() {
+        for argv in [
+            vec!["irohlan", "create", "--no-relay"],
+            vec!["irohlan", "create", "--relay-limit-kib", "2048"],
+            vec!["irohlan", "create", "--subnet", "10.42.0.0/24"],
+            vec!["irohlan", "join", "--ip", "10.13.37.7"],
+            vec!["irohlan", "run", "--metrics-addr", "127.0.0.1:9090"],
+            vec!["irohlan", "run", "--no-metrics"],
+        ] {
+            match Cli::try_parse_from(&argv) {
+                Ok(_) => panic!("{argv:?} was accepted"),
+                Err(err) => assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{argv:?}"),
+            }
+        }
     }
 }
