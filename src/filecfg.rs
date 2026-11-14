@@ -316,13 +316,14 @@ mod tests {
         assert!(cfg.subnet6.is_none());
     }
 
-    /// The examples in the repo root are copy-paste material. A renamed key
+    /// The examples in `example/` are copy-paste material. A renamed key
     /// would otherwise only be noticed by whoever copied the broken file.
     #[test]
     fn shipped_examples_parse() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-        let create: CreateConfig = super::load(&root.join("create.example.json")).unwrap();
+        let create: CreateConfig =
+            super::load(&root.join("example").join("create.example.json")).unwrap();
         // No `secret` on purpose: the creator generates one and prints it.
         assert!(create.secret.is_none());
         assert_eq!(create.subnet, "10.13.37.0/24");
@@ -332,7 +333,8 @@ mod tests {
         assert_eq!(create.mtu, DEFAULT_MTU);
         assert_eq!(create.relay_limit_kib, 0);
 
-        let join: JoinConfig = super::load(&root.join("join.example.json")).unwrap();
+        let join: JoinConfig =
+            super::load(&root.join("example").join("join.example.json")).unwrap();
         // No `ticket` on purpose: it is passed as the positional argument.
         assert!(join.ticket.is_none());
         // The examples are a matched pair: `ip` sits in the subnet `create`
@@ -348,7 +350,42 @@ mod tests {
         assert_eq!(join.mtu, DEFAULT_MTU);
         assert_eq!(join.relay_limit_kib, 0);
 
-        let run: RunConfig = super::load(&root.join("run.example.json")).unwrap();
+        let run: RunConfig = super::load(&root.join("example").join("run.example.json")).unwrap();
+
+        // The throughput workflow (`.github/workflows/test.yml`) boots both
+        // nodes straight from these two files. If a key drifts or a pinned
+        // address leaves the subnet, `cargo test` must fail here — long
+        // before a red CI job has to explain itself from an artifact.
+        let bench_creator: CreateConfig =
+            super::load(&root.join("example").join("bench-creator.json")).unwrap();
+        assert_eq!(bench_creator.subnet, "10.13.37.0/24");
+        assert!(bench_creator.no_ipv6, "bench network is IPv4-only");
+        assert!(bench_creator.no_relay, "an isolated netns has no relay path");
+        assert!(bench_creator.no_mdns);
+        assert_eq!(
+            crate::bus::BusMode::parse(&bench_creator.bus).unwrap(),
+            crate::bus::BusMode::Flood,
+            "gossip needs address lookup that an isolated netns cannot provide"
+        );
+        assert_eq!(bench_creator.mtu, 1400);
+        assert!(bench_creator.secret.is_some(), "both nodes share one secret");
+
+        let bench_joiner: JoinConfig =
+            super::load(&root.join("example").join("bench-joiner.json")).unwrap();
+        assert_eq!(
+            bench_joiner.ip.map(|a| a.to_string()).as_deref(),
+            Some("10.13.37.2"),
+            "the workflow pings and drives iperf3 against this pinned address"
+        );
+        assert!(
+            bench_joiner.ip6.is_none(),
+            "the creator runs IPv4-only; a pinned ip6 would be rejected at join time"
+        );
+        assert_eq!(
+            bench_joiner.secret.as_deref(),
+            bench_creator.secret.as_deref(),
+            "the pair must share the network secret"
+        );
         assert_eq!(run.dev.as_deref(), Some("irohlan0"));
         // `run` only shows an override: the cap persists in network.json, this
         // file turns it off for one boot. Keys it omits keep the persisted

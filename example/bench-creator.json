@@ -1,0 +1,12 @@
+{
+  "subnet": "10.13.37.0/24",
+  "no-ipv6": true,
+  "secret": "irohlan-benchmark-only-secret",
+  "dev": "tap-a",
+  "mtu": 1400,
+  "no-relay": true,
+  "no-mdns": true,
+  "bus": "flood",
+  "topology": "full",
+  "metrics-addr": "127.0.0.1:9090"
+}

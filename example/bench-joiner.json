@@ -1,0 +1,11 @@
+{
+  "secret": "irohlan-benchmark-only-secret",
+  "ip": "10.13.37.2",
+  "dev": "tap-b",
+  "mtu": 1400,
+  "no-relay": true,
+  "no-mdns": true,
+  "bus": "flood",
+  "topology": "full",
+  "metrics-addr": "127.0.0.1:9090"
+}

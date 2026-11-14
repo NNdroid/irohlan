@@ -57,7 +57,7 @@ mDNS、网络邻居发现、局域网游戏等原生二层流量直接工作。�
 
 ```bash
 # 机器 A(创建者):复制示例,按需改 subnet / subnet6
-cp create.example.json creator.json && "$EDITOR" creator.json
+cp example/create.example.json creator.json && "$EDITOR" creator.json
 sudo ./irohlan create --config creator.json
 # 输出:
 #   addresses : 10.13.37.1, fd00:1234:5678::1
@@ -66,7 +66,7 @@ sudo ./irohlan create --config creator.json
 #   join ticket   : irohlan1_BBBB...
 
 # 机器 B(加入者):把 secret 换成 A 打印的那个
-cp join.example.json member.json && "$EDITOR" member.json
+cp example/join.example.json member.json && "$EDITOR" member.json
 sudo ./irohlan join irohlan1_BBBB... --config member.json
 
 # 回到机器 A 验证:B 按示例固定为 10.13.37.7
@@ -110,7 +110,7 @@ flag,也不会出现"CLI 默认值和引擎默认值各写一遍、改一处漏�
 }
 ```
 
-这就是根目录的 [`create.example.json`](create.example.json),`cp` 过去改几个值即可。
+这就是 [`example/create.example.json`](example/create.example.json),`cp` 过去改几个值即可。
 
 ```bash
 irohlan create --config node.json
@@ -126,14 +126,15 @@ irohlan run --config node.json                      # 只覆盖想改的那几�
 
 `irohlan <子命令> --help` 会把上面这些键连同一个完整示例打印出来,不用翻文档。
 
-根目录下有三个可直接复制改用的最小示例(键集严格互斥,拿错文件会立刻报
-`unknown field`):
+[`example/`](example/) 目录下有三个可直接复制改用的最小示例(键集严格互斥,拿错
+文件会立刻报 `unknown field`;同目录还有 CI 吞吐测试引用的 `bench-*.json`,见
+[example/README.md](example/README.md)):
 
 | 文件 | 用于 | 里面写了什么 |
 |---|---|---|
-| [`create.example.json`](create.example.json) | `irohlan create --config` | 子网、**钉住的 IPv6 前缀**(`subnet6`)、设备名、MTU、metrics 端口。**故意不写 `secret`** —— 创建者会自动生成并打印 |
-| [`join.example.json`](join.example.json) | `irohlan join <ticket> --config` | 口令(`secret` 改成创建者打印的那个)、固定虚拟 IPv4 + **配对的 IPv6**、设备名;ticket 走位置参数 |
-| [`run.example.json`](run.example.json) | `irohlan run --config` | 只覆盖两项:**临时关掉持久化的中继上限**,其余沿用 `network.json` |
+| [`create.example.json`](example/create.example.json) | `irohlan create --config` | 子网、**钉住的 IPv6 前缀**(`subnet6`)、设备名、MTU、metrics 端口。**故意不写 `secret`** —— 创建者会自动生成并打印 |
+| [`join.example.json`](example/join.example.json) | `irohlan join <ticket> --config` | 口令(`secret` 改成创建者打印的那个)、固定虚拟 IPv4 + **配对的 IPv6**、设备名;ticket 走位置参数 |
+| [`run.example.json`](example/run.example.json) | `irohlan run --config` | 只覆盖两项:**临时关掉持久化的中继上限**,其余沿用 `network.json` |
 
 前两个文件是**成对**的:`subnet6` 把前缀定在 `fd00:1234:5678::/64`,`join` 的 `ip` /
 `ip6` 都落在 host index 7 上(`10.13.37.7` ↔ `fd00:1234:5678::7`)。如果创建者不写
@@ -141,10 +142,10 @@ irohlan run --config node.json                      # 只覆盖想改的那几�
 才知道,写死会报 `... is outside the virtual subnet`。
 
 ```bash
-cp create.example.json creator.json && "$EDITOR" creator.json
+cp example/create.example.json creator.json && "$EDITOR" creator.json
 sudo ./irohlan create --config creator.json
 
-cp join.example.json member.json && "$EDITOR" member.json   # 填入口令
+cp example/join.example.json member.json && "$EDITOR" member.json   # 填入口令
 sudo ./irohlan join irohlan1_BBBB... --config member.json
 ```
 
@@ -390,6 +391,17 @@ timed out` 会反复出现。后果不是 QUIC 断链 —— `connected_peers`�
 封装成 `(origin, seq)` 信封沿**已建立的 mesh 连接**泛洪,不需要地址发现;relay
 拓扑另外把 `mesh-links` 设为 1,让 partial-mesh dialer 不再尝试拨没有地址的 c。
 mDNS 保持开启但不在关键路径上,它和 pkarr/DNS 超时只是预期日志噪声。
+
+### 吞吐门禁(test.yml)
+
+弱网矩阵之外还有一道**常开的真实吞吐门禁**:
+[`.github/workflows/test.yml`](.github/workflows/test.yml) 在每次 push / PR 上
+用两个 netns + 一对 veth 把 [example/bench-creator.json](example/bench-creator.json)
+与 [example/bench-joiner.json](example/bench-joiner.json) **原样**跑起来(不加
+netem,clean underlay),以 `iperf3` 穿过 TAP 实测 TCP goodput 并断言下限
+(默认 100 Mbit/s,手动触发可调),UDP 丢包/抖动与 mesh 线路路径计数
+(datagram vs uni-stream)写入 Job Summary。它同时守着「example 里的配置
+能直接跑通」这件事本身;深挖弱网仍用 `benchmark.yml` 手动触发。
 
 第三次 CI 复验又暴露出更底层的 **mesh 单向传输问题**:flood 已经能把创建者的
 帧送到加入者(加入者 `frames_to_tap` 持续增长),但反方向只通最初几个包就停,
