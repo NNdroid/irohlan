@@ -1,0 +1,386 @@
+name: Overlay throughput test
+
+# Workflow split:
+#   ci.yml        — static checks + unit tests (no privileges needed)
+#   test.yml      — THIS: real data-plane throughput gate on push/PR. Boots two
+#                   nodes from the static example/bench-*.json configs inside
+#                   network namespaces and measures iperf3 goodput through the
+#                   TAP overlay on a clean underlay.
+#   benchmark.yml — manual-only weak-network matrix (tc netem profiles), which
+#                   generates its own per-node configs under bench/.
+#
+# The configs in example/ are used exactly as shipped: if someone edits them
+# into something that cannot join or carry traffic, this workflow fails.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      min_mbps:
+        description: 'TCP goodput floor in Mbit/s (assert)'
+        required: false
+        default: '100'
+        type: string
+      duration:
+        description: 'Seconds per iperf3 run'
+        required: false
+        default: '10'
+        type: string
+      parallel:
+        description: 'Parallel TCP streams'
+        required: false
+        default: '4'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: irohlan-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fallbacks also cover inputs left blank on a manual run.
+  MIN_MBPS: ${{ inputs.min_mbps || '100' }}
+  TEST_DURATION: ${{ inputs.duration || '10' }}
+  TEST_PARALLEL: ${{ inputs.parallel || '4' }}
+
+jobs:
+  throughput:
+    name: Real overlay throughput (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            iproute2 iperf3 iputils-ping python3 coreutils
+          # GitHub runners normally expose /dev/net/tun; create it if the
+          # kernel module is built in but the device node is absent.
+          sudo modprobe tun || true
+          if [[ ! -e /dev/net/tun ]]; then
+            sudo mkdir -p /dev/net
+            sudo mknod /dev/net/tun c 10 200
+            sudo chmod 666 /dev/net/tun
+          fi
+          ip -V
+          iperf3 --version
+          ls -l /dev/net/tun
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Smoke test CLI
+        run: ./target/release/irohlan --help
+
+      - name: Overlay throughput test
+        # Every iperf3 call is individually bounded; this is a backstop so a
+        # regression cannot pin a runner until the job timeout.
+        timeout-minutes: 12
+        run: |
+          sudo WORKDIR="$PWD" DURATION="$TEST_DURATION" PARALLEL="$TEST_PARALLEL" \
+            MIN_MBPS="$MIN_MBPS" bash -s <<'SCRIPT'
+          set -euo pipefail
+
+          log() { printf '[test] %s\n' "$*" >&2; }
+          die() { printf '[test] ERROR: %s\n' "$*" >&2; exit 1; }
+
+          ROOT="$WORKDIR"
+          BIN="$ROOT/target/release/irohlan"
+          RUN="$ROOT/test-run"
+          STATE="$RUN/state"
+          LOGS="$RUN/logs"
+          RESULTS="$RUN/results"
+          # The point of this workflow: the nodes run on the shipped example
+          # configs, unmodified.
+          CFG_A="$ROOT/example/bench-creator.json"
+          CFG_B="$ROOT/example/bench-joiner.json"
+          NS_A=irohlan-a
+          NS_B=irohlan-b
+          VIP_A=10.13.37.1
+          VIP_B=10.13.37.2
+          MTU=1400
+          READY_TIMEOUT=90
+          # A single lucky echo reply is not readiness (bench/lib.sh learned
+          # this the hard way); require consecutive successes.
+          READY_STREAK=3
+          SERVER_SECS=$((DURATION + 45))
+          CLIENT_SECS=$((DURATION + 30))
+
+          mkdir -p "$STATE/a" "$STATE/b" "$LOGS" "$RESULTS"
+          [[ -f "$CFG_A" && -f "$CFG_B" ]] || die "example bench configs are missing"
+
+          cleanup() {
+            local ns p
+            for ns in "$NS_A" "$NS_B"; do
+              for p in $(ip netns pids "$ns" 2>/dev/null || true); do
+                kill "$p" 2>/dev/null || true
+              done
+              ip netns del "$ns" 2>/dev/null || true
+            done
+          }
+          trap cleanup EXIT
+
+          # Kill iperf3 leftovers inside a namespace: `ip netns exec` forks,
+          # so a recorded PID may belong to the `ip` wrapper while iperf3 is
+          # a grandchild that keeps port 5201 busy.
+          kill_iperf() {
+            local ns=$1 p cmd
+            for p in $(ip netns pids "$ns" 2>/dev/null || true); do
+              cmd=""
+              if [[ -r "/proc/$p/cmdline" ]]; then
+                cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null || true)
+              fi
+              if [[ "$cmd" == *iperf3* ]]; then
+                kill -9 "$p" 2>/dev/null || true
+              fi
+            done
+          }
+
+          # --- topology: two namespaces over one veth hop --------------------
+          for ns in "$NS_A" "$NS_B"; do
+            ip netns del "$ns" 2>/dev/null || true
+            ip netns add "$ns"
+            ip netns exec "$ns" ip link set lo up
+          done
+          ip link add veth0l type veth peer name veth0r
+          ip link set veth0l netns "$NS_A"
+          ip link set veth0r netns "$NS_B"
+          ip netns exec "$NS_A" ip link set veth0l mtu "$MTU" up
+          ip netns exec "$NS_B" ip link set veth0r mtu "$MTU" up
+          ip netns exec "$NS_A" ip addr add 172.20.1.1/30 dev veth0l
+          ip netns exec "$NS_B" ip addr add 172.20.1.2/30 dev veth0r
+          log "topology: $NS_A --veth-- $NS_B (underlay 172.20.1.0/30, mtu $MTU)"
+
+          # --- creator (namespace a) on example/bench-creator.json ----------
+          ip netns exec "$NS_A" env XDG_STATE_HOME="$STATE/a" \
+            "$BIN" create --config "$CFG_A" >"$LOGS/a.log" 2>&1 &
+          log "creator started (config example/bench-creator.json)"
+
+          # The creator writes ticket.txt right after its banner; polling
+          # `show` is cleaner than scraping stdout of a background process.
+          ticket=""
+          for i in $(seq 1 60); do
+            ticket=$(env XDG_STATE_HOME="$STATE/a" "$BIN" show 2>/dev/null || true)
+            if [[ "$ticket" == irohlan1_* ]]; then
+              break
+            fi
+            ticket=""
+            sleep 1
+          done
+          [[ -n "$ticket" ]] || die "creator published no join ticket; see $LOGS/a.log"
+          log "ticket acquired (${#ticket} chars)"
+
+          # --- joiner (namespace b) on example/bench-joiner.json ------------
+          ip netns exec "$NS_B" env XDG_STATE_HOME="$STATE/b" \
+            "$BIN" join "$ticket" --config "$CFG_B" >"$LOGS/b.log" 2>&1 &
+          log "joiner started (config example/bench-joiner.json)"
+
+          # --- readiness: consecutive pings across the overlay ---------------
+          streak=0
+          ready=0
+          for i in $(seq 1 "$READY_TIMEOUT"); do
+            if ip netns exec "$NS_A" ping -c 1 -W 2 "$VIP_B" >/dev/null 2>&1; then
+              streak=$((streak + 1))
+              if ((streak >= READY_STREAK)); then
+                ready=1
+                log "overlay ready after ${i}s ($READY_STREAK consecutive pings a -> $VIP_B)"
+                break
+              fi
+            else
+              streak=0
+            fi
+            sleep 1
+          done
+          if ((ready == 0)); then
+            log "overlay never became ready; dumping diagnostics"
+            for ns in "$NS_A" "$NS_B"; do
+              ip netns exec "$ns" ip -brief addr show >&2 || true
+              ip netns exec "$ns" ip -s link show >&2 || true
+              ip netns exec "$ns" ip neigh show >&2 || true
+            done
+            tail -n 40 "$LOGS/a.log" >&2 || true
+            tail -n 40 "$LOGS/b.log" >&2 || true
+            die "overlay not ready within ${READY_TIMEOUT}s"
+          fi
+
+          # --- iperf3 TCP through the overlay --------------------------------
+          run_server() {
+            ip netns exec "$NS_B" timeout -k 5 "$SERVER_SECS" \
+              iperf3 -s -B "$VIP_B" -J --one-off \
+              >"$RESULTS/$1-server.json" 2>"$RESULTS/$1-server.err" &
+          }
+          run_client() {
+            ip netns exec "$NS_A" timeout -k 5 "$CLIENT_SECS" \
+              iperf3 -c "$VIP_B" -B "$VIP_A" "$@" -J \
+              >"$RESULTS/$1.json" 2>"$RESULTS/$1.err" || true
+            kill_iperf "$NS_B"
+          }
+
+          run_server tcp
+          sleep 1
+          log "iperf3 TCP: ${DURATION}s x ${PARALLEL} streams (floor ${MIN_MBPS} Mbit/s)"
+          run_client tcp -t "$DURATION" -P "$PARALLEL"
+
+          # --- iperf3 UDP through the overlay (informational) ----------------
+          run_server udp
+          sleep 1
+          log "iperf3 UDP: ${DURATION}s at 500M target"
+          run_client udp -u -b 500M -t "$DURATION"
+
+          # --- collect + parse + assert --------------------------------------
+          for node in a b; do
+            cp "$LOGS/$node.log" "$RESULTS/log-$node.txt" 2>/dev/null || true
+            cp "$STATE/$node/irohlan/status.json" "$RESULTS/status-$node.json" 2>/dev/null || true
+            cp "$STATE/$node/irohlan/metrics.prom" "$RESULTS/metrics-$node.prom" 2>/dev/null || true
+          done
+
+          python3 - "$RESULTS" "$MIN_MBPS" "$DURATION" "$PARALLEL" "$STATE" <<'PY'
+          import json, pathlib, re, sys
+
+          results = pathlib.Path(sys.argv[1])
+          floor = float(sys.argv[2])
+          duration = int(sys.argv[3])
+          parallel = int(sys.argv[4])
+          state = pathlib.Path(sys.argv[5])
+
+          def load(name):
+              try:
+                  return json.loads((results / name).read_text())
+              except Exception as e:
+                  raise SystemExit(
+                      f"::error::iperf3 result {name} unreadable: {e} (see {name}.err)"
+                  )
+
+          end = load("tcp.json").get("end", {})
+          recv = end.get("sum_received") or {}
+          bps = recv.get("bits_per_second")
+          if bps is None:
+              raise SystemExit(
+                  "::error::tcp.json has no end.sum_received.bits_per_second"
+              )
+          mbps = bps / 1e6
+
+          udp_txt = "n/a"
+          try:
+              uend = load("udp.json").get("end", {})
+              usum = uend.get("sum") or uend.get("sum_received") or uend.get("sum_sent") or {}
+              if usum.get("lost_percent") is not None:
+                  udp_txt = (
+                      f"{usum.get('bits_per_second', 0) / 1e6:.1f} Mbit/s, "
+                      f"loss {usum['lost_percent']:.2f}%, "
+                      f"jitter {usum.get('jitter_ms', 0):.3f} ms"
+                  )
+          except Exception as e:
+              udp_txt = f"parse failed: {e}"
+
+          # Cumulative wire-path split straight from the nodes' metrics.prom:
+          # a high stream share with tiny datagram counts means full frames
+          # are missing the QUIC datagram budget (see src/tap.rs docs).
+          def mesh_frames(path):
+              res = {}
+              try:
+                  text = pathlib.Path(path).read_text()
+              except Exception:
+                  return res
+              pat = r'irohlan_mesh_frames_total\{direction="(\w+)",path="(\w+)"\}\s+(\d+)'
+              for m in re.finditer(pat, text):
+                  res[(m.group(1), m.group(2))] = int(m.group(3))
+              return res
+
+          a = mesh_frames(state / "a" / "irohlan" / "metrics.prom")
+          b = mesh_frames(state / "b" / "irohlan" / "metrics.prom")
+
+          ok = mbps >= floor
+          lines = [
+              "## irohlan overlay throughput",
+              "",
+              f"- **TCP goodput: {mbps:.1f} Mbit/s** "
+              f"(floor {floor:g}, {duration}s x {parallel} streams) — "
+              f"{'PASS' if ok else 'FAIL'}",
+              f"- UDP (500M target): {udp_txt}",
+          ]
+          if a or b:
+              lines.append(
+                  f"- wire path tx frames — creator: datagram "
+                  f"{a.get(('tx', 'datagram'), 0)} / stream {a.get(('tx', 'stream'), 0)}; "
+                  f"joiner: datagram {b.get(('tx', 'datagram'), 0)} / "
+                  f"stream {b.get(('tx', 'stream'), 0)}"
+              )
+          (results / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          (results / "verdict.json").write_text(
+              json.dumps({"tcp_mbps": mbps, "floor_mbps": floor, "pass": ok}, indent=2),
+              encoding="utf-8",
+          )
+          print(f"TCP goodput: {mbps:.1f} Mbit/s (floor {floor:g})")
+          if not ok:
+              print(
+                  f"::error::overlay TCP goodput {mbps:.1f} Mbit/s is below the "
+                  f"{floor:g} Mbit/s floor"
+              )
+              sys.exit(1)
+          PY
+          log "done: results in $RESULTS"
+          SCRIPT
+
+      - name: Make results readable
+        if: always()
+        run: |
+          if [[ -d test-run ]]; then
+            sudo chown -R "$(id -u):$(id -g)" test-run || true
+          fi
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          {
+            echo "## irohlan overlay throughput"
+            echo ""
+            if [[ -f test-run/results/summary.md ]]; then
+              cat test-run/results/summary.md
+            else
+              echo "No summary was produced; check the run log."
+            fi
+            echo ""
+            echo "- configs: \`example/bench-creator.json\` + \`example/bench-joiner.json\` (used as shipped)"
+            echo "- results: see the \`irohlan-throughput-results\` artifact"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          shopt -s nullglob
+          for f in test-run/results/*.err test-run/logs/*.log; do
+            echo "### $f"
+            echo '```'
+            tail -n 30 "$f"
+            echo '```'
+          done >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: irohlan-throughput-results
+          path: |
+            test-run/results/summary.md
+            test-run/results/verdict.json
+            test-run/results/tcp.json
+            test-run/results/tcp.err
+            test-run/results/udp.json
+            test-run/results/udp.err
+            test-run/results/*.err
+            test-run/results/status-*.json
+            test-run/results/metrics-*.prom
+            test-run/results/log-*.txt
+            test-run/logs/*.log
+          if-no-files-found: warn
+          retention-days: 15
