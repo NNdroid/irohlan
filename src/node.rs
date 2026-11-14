@@ -384,6 +384,20 @@ pub async fn run_node(
     let switch_bus_events = bus.subscribe();
     let node_bus_events = bus.subscribe();
 
+    // Broadcast publisher: the switch hands bus frames to this task instead
+    // of awaiting the gossip bus inside its forwarding loop, so a slow
+    // broadcast (shared sender mutex, network wait) can never stall unicast
+    // forwarding. A single publisher also keeps broadcast frames in order.
+    let (bus_frame_tx, mut bus_frame_rx) = mpsc::channel::<BusMsg>(256);
+    tokio::spawn({
+        let bus = bus.clone();
+        async move {
+            while let Some(msg) = bus_frame_rx.recv().await {
+                bus.publish(msg).await;
+            }
+        }
+    });
+
     // --- routing -------------------------------------------------------------
     let routing = Arc::new(RwLock::new(RoutingTable::new(IdBytes::from(my_id))));
     let my_mac = crypto::mac_from_id(my_id.as_bytes());
@@ -564,7 +578,7 @@ pub async fn run_node(
         membership.clone(),
         routing.clone(),
         mesh.clone(),
-        bus.clone(),
+        bus_frame_tx,
         to_tap_tx,
         counters.clone(),
         relay.clone(),

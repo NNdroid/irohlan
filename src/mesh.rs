@@ -242,10 +242,11 @@ impl Shared {
 
     /// Send a tagged payload to all peers except `exclude`.
     ///
-    /// The payload is copied once and then shared by every peer's queue: a
-    /// flood to N peers used to make N copies of the whole envelope.
-    fn flood_out(&self, tagged: &[u8], exclude: Option<EndpointId>) {
-        let tagged = Bytes::copy_from_slice(tagged);
+    /// The payload is shared by every peer's queue: `Bytes::clone` is a
+    /// reference-count bump, so a flood to N peers costs one allocation.
+    /// Taking the buffer by value lets the caller hand over its allocation
+    /// without a copy.
+    fn flood_out(&self, tagged: Bytes, exclude: Option<EndpointId>) {
         let peers = self.peers.lock().expect("peers lock");
         for (id, handles) in peers.iter() {
             if Some(*id) == exclude {
@@ -1193,7 +1194,9 @@ impl Mesh {
         let mut tagged = Vec::with_capacity(payload.len() + 1);
         tagged.push(tag::FLOOD);
         tagged.extend_from_slice(&payload);
-        self.shared.flood_out(&tagged, exclude);
+        // `Bytes::from` adopts the Vec's allocation: the peer queues below
+        // share it by reference count instead of copying the envelope again.
+        self.shared.flood_out(Bytes::from(tagged), exclude);
     }
 
     /// Next sequence number for envelopes published by ourselves.

@@ -422,7 +422,6 @@ impl RelayControl {
         now: Instant,
     ) -> RelayDecision {
         let bytes = frame.len() as u64;
-        let fid = flow_id(&frame);
         let mut state = self.state.lock().expect("relay lock");
         state.account_in(from, bytes, now);
 
@@ -431,6 +430,10 @@ impl RelayControl {
             return RelayDecision::Forward { hop, frame };
         }
 
+        // Only the queueing path below needs the flow hash. Computing it
+        // unconditionally cost a full-frame blake3 per relayed frame even in
+        // accounting-only mode, where the value is discarded.
+        let fid = flow_id(&frame);
         state.peer_mut(from, now).source_seen = Some(now);
         state.rebalance(now);
 

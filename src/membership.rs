@@ -25,6 +25,12 @@ pub struct MemberInfo {
 #[derive(Debug, Default)]
 pub struct Membership {
     peers: RwLock<HashMap<IdBytes, MemberInfo>>,
+    /// MAC → endpoint id index. The virtual MAC is a pure function of the
+    /// endpoint id, so the index only changes on insert/remove. `by_mac`
+    /// runs for every forwarded unicast frame (twice on a relaying node)
+    /// and must be O(1) — a scan would pay one blake3 hash per member for
+    /// every frame.
+    macs: RwLock<HashMap<[u8; 6], IdBytes>>,
 }
 
 impl Membership {
@@ -35,8 +41,10 @@ impl Membership {
     /// Insert or refresh a member. Returns `true` if this introduced a
     /// previously unknown endpoint id or changed its address.
     pub fn upsert(&self, record: MemberRecord) -> bool {
+        let id = record.id;
+        let mac = crate::crypto::mac_from_id(id.as_bytes());
         let mut peers = self.peers.write().expect("membership lock poisoned");
-        match peers.get_mut(&record.id) {
+        let changed = match peers.get_mut(&id) {
             Some(info) => {
                 info.last_seen = Instant::now();
                 if info.record != record {
@@ -51,7 +59,7 @@ impl Membership {
             }
             None => {
                 peers.insert(
-                    record.id,
+                    id,
                     MemberInfo {
                         record,
                         last_seen: Instant::now(),
@@ -59,7 +67,17 @@ impl Membership {
                 );
                 true
             }
+        };
+        drop(peers);
+        if changed {
+            // The MAC is derived from the id, so this can only ever (re)write
+            // the same entry — an address refresh changes no key here.
+            self.macs
+                .write()
+                .expect("membership lock poisoned")
+                .insert(mac, id);
         }
+        changed
     }
 
     /// Remove members that have not announced themselves within [`MEMBER_TTL`].
@@ -71,10 +89,20 @@ impl Membership {
             .filter(|(_, info)| info.last_seen.elapsed() > MEMBER_TTL)
             .map(|(id, _)| *id)
             .collect();
-        stale
-            .into_iter()
-            .filter_map(|id| peers.remove(&id).map(|i| i.record))
-            .collect()
+        let mut dropped = Vec::with_capacity(stale.len());
+        for id in &stale {
+            if let Some(info) = peers.remove(id) {
+                dropped.push(info.record);
+            }
+        }
+        drop(peers);
+        if !dropped.is_empty() {
+            let mut macs = self.macs.write().expect("membership lock poisoned");
+            for info in &dropped {
+                macs.remove(&crate::crypto::mac_from_id(info.id.as_bytes()));
+            }
+        }
+        dropped
     }
 
     pub fn get(&self, id: &IdBytes) -> Option<MemberInfo> {
@@ -87,11 +115,16 @@ impl Membership {
 
     /// Resolve a destination MAC to a member record. `None` means the frame
     /// targets a MAC that is not (or no longer) a member of this LAN.
+    ///
+    /// O(1) through the MAC index: the index maps MAC → id, and the member
+    /// table holds the record. The two locks are always taken one after the
+    /// other, never nested.
     pub fn by_mac(&self, mac: &[u8; 6]) -> Option<MemberInfo> {
-        let peers = self.peers.read().expect("membership lock poisoned");
-        peers
-            .values()
-            .find(|info| crate::crypto::mac_from_id(info.record.id.as_bytes()) == *mac)
+        let id = *self.macs.read().expect("membership lock poisoned").get(mac)?;
+        self.peers
+            .read()
+            .expect("membership lock poisoned")
+            .get(&id)
             .cloned()
     }
 
@@ -189,6 +222,33 @@ mod tests {
         assert!(m.by_ip(IpAddr::V6("fd00::3".parse().unwrap())).is_some());
         assert!(m.by_ip(IpAddr::V4(Ipv4Addr::new(10, 13, 37, 2))).is_none());
         assert!(m.by_ip(IpAddr::V6("fd00::2".parse().unwrap())).is_none());
+    }
+
+    #[test]
+    fn mac_index_tracks_insert_refresh_and_expiry() {
+        let m = Membership::new();
+        let r = rec(4, dual(5));
+        let mac = crate::crypto::mac_from_id(r.id.as_bytes());
+        assert!(m.by_mac(&mac).is_none(), "nothing indexed before insert");
+
+        m.upsert(r.clone());
+        assert_eq!(m.by_mac(&mac).unwrap().record, r);
+        // A refresh with unchanged record must not disturb the index.
+        assert!(!m.upsert(r.clone()));
+        assert!(m.by_mac(&mac).is_some());
+        // An address change re-indexes the same MAC.
+        assert!(m.upsert(rec(4, dual(6))));
+        assert!(m.by_mac(&mac).is_some());
+
+        // Expiry removes the member and its index entry.
+        {
+            let mut peers = m.peers.write().unwrap();
+            for info in peers.values_mut() {
+                info.last_seen -= MEMBER_TTL + Duration::from_secs(1);
+            }
+        }
+        assert_eq!(m.expire().len(), 1);
+        assert!(m.by_mac(&mac).is_none(), "expired member leaves the index");
     }
 
     #[test]

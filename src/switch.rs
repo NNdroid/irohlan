@@ -31,7 +31,7 @@ use bytes::Bytes;
 use iroh::EndpointId;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::bus::{BroadcastBus, BusEvent};
+use crate::bus::BusEvent;
 use crate::crypto;
 use crate::membership::Membership;
 use crate::mesh::{InboundFrame, Mesh};
@@ -67,7 +67,10 @@ pub struct Switch {
     membership: Arc<Membership>,
     routing: Arc<RwLock<RoutingTable>>,
     mesh: Arc<Mesh>,
-    bus: Arc<BroadcastBus>,
+    /// Sender into the bus publisher task. The loop never awaits the bus
+    /// itself: the gossip sender is shared with the announce and LSA tasks,
+    /// and waiting on it here would stall all forwarding.
+    bus_tx: mpsc::Sender<BusMsg>,
     to_tap: mpsc::Sender<Bytes>,
     counters: Arc<Counters>,
     relay: Arc<RelayControl>,
@@ -83,7 +86,7 @@ impl Switch {
         membership: Arc<Membership>,
         routing: Arc<RwLock<RoutingTable>>,
         mesh: Arc<Mesh>,
-        bus: Arc<BroadcastBus>,
+        bus_tx: mpsc::Sender<BusMsg>,
         to_tap: mpsc::Sender<Bytes>,
         counters: Arc<Counters>,
         relay: Arc<RelayControl>,
@@ -93,7 +96,7 @@ impl Switch {
             membership,
             routing,
             mesh,
-            bus,
+            bus_tx,
             to_tap,
             counters,
             relay,
@@ -143,7 +146,13 @@ impl Switch {
             .fetch_add(1, Ordering::Relaxed);
         match classify_frame(&frame) {
             Some(FrameClass::Broadcast) | Some(FrameClass::Multicast) => {
-                self.bus.publish(BusMsg::Frame(frame.to_vec())).await;
+                // Hand off to the bus publisher task instead of awaiting the
+                // bus here. A full publisher queue drops the frame — safe
+                // for ARP/NDP, which retry on their own.
+                if self.bus_tx.try_send(BusMsg::Frame(frame.to_vec())).is_err() {
+                    self.counters.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("bus publisher queue full, broadcast frame dropped");
+                }
             }
             Some(FrameClass::Unicast(mac)) => {
                 let Some(member) = self.membership.by_mac(&mac) else {
