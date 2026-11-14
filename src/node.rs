@@ -26,7 +26,7 @@ use crate::crypto;
 use crate::membership::Membership;
 use crate::mesh::{Mesh, MeshChannels, MeshConfig};
 use crate::netaddr::{ula_prefix, AddrPlan, V4Net, V6Net, VirtualAddrs};
-use crate::proto::{BusMsg, IdBytes, LinkMetric, LinkStateMsg};
+use crate::proto::{BusMsg, IdBytes, LinkMetric, LinkStateMsg, seq_base};
 use crate::relay::RelayControl;
 use crate::routing::{LinkSmoother, RoutingTable, LSA_REFRESH_INTERVAL};
 use crate::switch::{Counters, Switch};
@@ -399,13 +399,17 @@ pub async fn run_node(
         let bus = bus.clone();
         let mut events = events;
         async move {
-            let mut lsa_seq: u64 = 0;
+            // Seeded from the wall clock: a counter that starts at zero
+            // resumes below what every peer already saw before the restart,
+            // and their routing tables would reject our advertisements as
+            // stale (see `proto::seq_base`).
+            let mut lsa_seq: u64 = seq_base();
             let mut smoother = LinkSmoother::new();
             let mut refresh = interval(LSA_REFRESH_INTERVAL);
             refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                tokio::select! {
-                    _ = refresh.tick() => {}
+                let refresh_tick = tokio::select! {
+                    _ = refresh.tick() => true,
                     ev = events.recv() => match ev {
                         Ok(ev) => match ev {
                             crate::mesh::MeshEvent::PeerUp(id) => {
@@ -426,9 +430,11 @@ pub async fn run_node(
                                 if !record.addrs.is_empty() {
                                     bus.publish(BusMsg::Announce(record)).await;
                                 }
+                                false
                             }
                             crate::mesh::MeshEvent::PeerDown(id) => {
                                 tracing::debug!(peer = %id.fmt_short(), "mesh event: peer down");
+                                false
                             }
                         },
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -437,18 +443,25 @@ pub async fn run_node(
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                }
+                };
                 let samples: Vec<LinkMetric> = mesh.neighbor_link_metrics();
                 smoother.update(&samples);
                 let links = smoother.snapshot();
-                routing.write().expect("routing lock").set_my_links(&links);
-                lsa_seq += 1;
-                bus.publish(BusMsg::LinkState(LinkStateMsg {
-                    origin: IdBytes::from(mesh.my_id()),
-                    seq: lsa_seq,
-                    links,
-                }))
-                .await;
+                let links_changed =
+                    routing.write().expect("routing lock").set_my_links(&links);
+                // Publish on the refresh tick (peers need it to keep the LSDB
+                // entry alive) and whenever our links actually changed. A
+                // burst of redundant mesh events must not turn into a burst
+                // of identical LSAs.
+                if refresh_tick || links_changed {
+                    lsa_seq += 1;
+                    bus.publish(BusMsg::LinkState(LinkStateMsg {
+                        origin: IdBytes::from(mesh.my_id()),
+                        seq: lsa_seq,
+                        links,
+                    }))
+                    .await;
+                }
             }
         }
     });

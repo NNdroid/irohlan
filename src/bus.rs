@@ -12,6 +12,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -27,6 +28,8 @@ use crate::proto::{BusMsg, FloodEnvelope, IdBytes, MemberRecord};
 const FLOOD_DEDUP_CAP: usize = 8192;
 /// Capacity of the event channel handed out to subscribers.
 const EVENT_CAP: usize = 256;
+/// How long to wait before retrying a failed gossip (re)subscription.
+const GOSSIP_REJOIN_DELAY: Duration = Duration::from_secs(5);
 
 /// Which transport the bus uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,7 +106,9 @@ impl DedupRing {
 pub struct BroadcastBus {
     mode: BusMode,
     event_tx: broadcast::Sender<BusEvent>,
-    gossip_tx: Option<tokio::sync::Mutex<GossipSender>>,
+    /// Shared with the receive pump so it can swap in a fresh sender after
+    /// rebuilding the subscription.
+    gossip_tx: Option<Arc<tokio::sync::Mutex<GossipSender>>>,
     mesh: Arc<Mesh>,
     seen: Mutex<DedupRing>,
 }
@@ -136,51 +141,75 @@ impl BroadcastBus {
     ) -> anyhow::Result<Arc<Self>> {
         let (event_tx, _) = broadcast::channel(EVENT_CAP);
 
-        let gossip_tx = match (mode, gossip) {
+        let gossip_tx: Option<Arc<tokio::sync::Mutex<GossipSender>>> = match (mode, gossip) {
             (BusMode::Gossip, Some(gossip)) => {
-                let topic = gossip.subscribe(topic_id, bootstrap).await?;
+                let topic = gossip.subscribe(topic_id, bootstrap.clone()).await?;
                 let (sender, mut receiver) = topic.split();
                 let events = event_tx.clone();
+                // The receive pump owns the subscription for the whole node
+                // lifetime. A stream error used to end it permanently — the
+                // bus went silent while the node looked healthy — so the
+                // topic is rebuilt here and the shared sender swapped out.
+                let sender = Arc::new(tokio::sync::Mutex::new(sender));
+                let pump_sender = sender.clone();
                 tokio::spawn(async move {
-                    while let Some(ev) = receiver.next().await {
-                        match ev {
-                            Ok(Event::Received(msg)) => {
-                                match postcard::from_bytes::<BusMsg>(&msg.content) {
-                                    Ok(BusMsg::Frame(frame)) => {
-                                        emit(&events, BusEvent::Frame(Bytes::from(frame)));
-                                    }
-                                    Ok(BusMsg::Announce(record)) => {
-                                        emit(&events, BusEvent::Announce(record));
-                                    }
-                                    Ok(BusMsg::LinkState(ls)) => {
-                                        emit(&events, BusEvent::LinkState(ls));
-                                    }
-                                    Err(err) => {
-                                        tracing::debug!("bad bus message: {err}");
+                    loop {
+                        while let Some(ev) = receiver.next().await {
+                            match ev {
+                                Ok(Event::Received(msg)) => {
+                                    match postcard::from_bytes::<BusMsg>(&msg.content) {
+                                        Ok(BusMsg::Frame(frame)) => {
+                                            emit(&events, BusEvent::Frame(Bytes::from(frame)));
+                                        }
+                                        Ok(BusMsg::Announce(record)) => {
+                                            emit(&events, BusEvent::Announce(record));
+                                        }
+                                        Ok(BusMsg::LinkState(ls)) => {
+                                            emit(&events, BusEvent::LinkState(ls));
+                                        }
+                                        Err(err) => {
+                                            tracing::debug!("bad bus message: {err}");
+                                        }
                                     }
                                 }
+                                Ok(Event::NeighborUp(id)) => {
+                                    emit(&events, BusEvent::NeighborUp(id));
+                                }
+                                Ok(Event::NeighborDown(id)) => {
+                                    emit(&events, BusEvent::NeighborDown(id));
+                                }
+                                Ok(Event::Lagged) => {
+                                    tracing::warn!("gossip subscription lagged, events dropped");
+                                }
+                                Ok(other) => {
+                                    tracing::debug!("unhandled gossip event: {other:?}");
+                                }
+                                Err(err) => {
+                                    tracing::warn!("gossip stream error: {err:#}");
+                                    break;
+                                }
                             }
-                            Ok(Event::NeighborUp(id)) => {
-                                emit(&events, BusEvent::NeighborUp(id));
-                            }
-                            Ok(Event::NeighborDown(id)) => {
-                                emit(&events, BusEvent::NeighborDown(id));
-                            }
-                            Ok(Event::Lagged) => {
-                                tracing::warn!("gossip subscription lagged, events dropped");
-                            }
-                            Ok(other) => {
-                                tracing::debug!("unhandled gossip event: {other:?}");
-                            }
-                            Err(err) => {
-                                tracing::warn!("gossip stream error: {err:#}");
-                                break;
+                        }
+                        tracing::warn!("gossip topic stream ended, resubscribing");
+                        loop {
+                            match gossip.subscribe(topic_id, bootstrap.clone()).await {
+                                Ok(topic) => {
+                                    let (fresh_sender, fresh_receiver) = topic.split();
+                                    *pump_sender.lock().await = fresh_sender;
+                                    receiver = fresh_receiver;
+                                    break;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "gossip resubscribe failed, retrying in {GOSSIP_REJOIN_DELAY:?}: {err:#}"
+                                    );
+                                    tokio::time::sleep(GOSSIP_REJOIN_DELAY).await;
+                                }
                             }
                         }
                     }
-                    tracing::warn!("gossip topic stream ended");
                 });
-                Some(tokio::sync::Mutex::new(sender))
+                Some(sender)
             }
             _ => None,
         };
@@ -233,6 +262,14 @@ impl BroadcastBus {
                     seq: self.mesh.next_seq(),
                     msg,
                 };
+                // Mark our own envelope before sending: peers further away
+                // relay it back to us, and without this mark the echo looks
+                // fresh — it would be flooded once more and delivered to the
+                // local TAP a second time.
+                self.seen
+                    .lock()
+                    .expect("dedup lock")
+                    .mark(&envelope.origin, envelope.seq);
                 self.mesh.flood_send(&envelope, None);
             }
         }

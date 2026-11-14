@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{ArgAction, Parser, Subcommand};
 
@@ -338,7 +339,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("no status file at {} — is a node running?", path.display());
             }
             let report = StatusReport::read(&path)?;
-            println!("updated   : {} s ago", report.updated_at_unix);
+            // `updated_at_unix` is an absolute timestamp; the reader wants
+            // the age, so subtract it from now (0 if the clock is behind).
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            println!(
+                "updated   : {} s ago",
+                now.saturating_sub(report.updated_at_unix)
+            );
             println!(
                 "endpoint  : {}",
                 report.endpoint_id.as_deref().unwrap_or("-")

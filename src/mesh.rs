@@ -36,7 +36,8 @@ use crate::crypto;
 use crate::membership::Membership;
 use crate::netaddr::VirtualAddrs;
 use crate::proto::{
-    lenframe, tag, CtrlMsg, FloodEnvelope, IdBytes, LinkMetric, MemberRecord, MAX_STREAM_MSG_LEN,
+    lenframe, tag, seq_base, CtrlMsg, FloodEnvelope, IdBytes, LinkMetric, MemberRecord,
+    MAX_STREAM_MSG_LEN,
 };
 use crate::routing::{ewma, MAX_RTT_MS, UNKNOWN_RTT_MS};
 
@@ -290,6 +291,17 @@ impl Shared {
             .is_some_and(|handles| !handles.is_empty())
     }
 
+    /// A live connection to `id`, if one is registered. Lets control requests
+    /// ride an existing link instead of dialing.
+    fn peer_conn(&self, id: &EndpointId) -> Option<Connection> {
+        self.peers
+            .lock()
+            .expect("peers lock")
+            .get(id)
+            .and_then(|handles| handles.first())
+            .map(|handle| handle.conn.clone())
+    }
+
     /// Remembered dial address for a peer we initiated a connection to.
     fn dial_target(&self, id: &EndpointId) -> Option<(EndpointAddr, VirtualAddrs)> {
         self.dial_targets
@@ -524,6 +536,29 @@ async fn auth_initiator(
         }
         CtrlMsg::AuthReject { reason } => Err(anyhow::anyhow!("rejected: {reason}")),
         other => Err(anyhow::anyhow!("unexpected auth reply: {other:?}")),
+    }
+}
+
+/// Ask a connected creator for an address assignment (`RequestIp`).
+///
+/// Used when an assignment dial finds a connection already registered: the
+/// creator reached us first, so the auth handshake that normally carries the
+/// grant never ran on our side.
+async fn request_addrs(
+    conn: &Connection,
+    desired: VirtualAddrs,
+) -> anyhow::Result<VirtualAddrs> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let req = CtrlMsg::RequestIp { desired };
+    lenframe::write(&mut send, &postcard::to_allocvec(&req)?).await?;
+    send.finish().ok();
+    let raw = timeout(AUTH_TIMEOUT, lenframe::read(&mut recv)).await??;
+    match postcard::from_bytes::<CtrlMsg>(&raw)? {
+        CtrlMsg::AssignIp { addrs } => Ok(addrs),
+        CtrlMsg::RejectIp { reason } => {
+            Err(anyhow::anyhow!("address request rejected: {reason}"))
+        }
+        other => Err(anyhow::anyhow!("unexpected reply to RequestIp: {other:?}")),
     }
 }
 
@@ -946,7 +981,10 @@ impl Mesh {
             Arc::new(Mesh {
                 shared,
                 router,
-                seq: AtomicU64::new(0),
+                // Seeded from the wall clock so a restarted node's flood
+                // sequence numbers resume above everything its peers still
+                // hold in their dedup rings (see [`crate::proto::seq_base`]).
+                seq: AtomicU64::new(seq_base()),
             }),
             MeshChannels {
                 frame_rx,
@@ -970,6 +1008,17 @@ impl Mesh {
 
     pub fn set_my_addrs(&self, addrs: VirtualAddrs) {
         *self.shared.my_addrs.write().expect("my_addrs lock") = addrs;
+    }
+
+    /// Whether we are still missing our own virtual addresses. A joiner in
+    /// this state must obtain a grant when dialing the creator, even if the
+    /// creator already has a connection to us.
+    fn needs_assignment(&self) -> bool {
+        self.shared
+            .my_addrs
+            .read()
+            .expect("my_addrs lock")
+            .is_empty()
     }
 
     /// Whether we hold at least one live connection to `id`.
@@ -1087,9 +1136,24 @@ impl Mesh {
                 .get(&IdBytes::from(remote))
                 .map(|m| m.record)
                 .unwrap_or_else(|| MemberRecord::empty_addrs(IdBytes::from(remote)));
+            // The creator can reach us before we dial it: it keeps redialing
+            // remembered members for up to the membership TTL, so a quick
+            // restart (`systemctl restart irohlan`) lands exactly in this
+            // window. A joiner that is still waiting for its address
+            // assignment must not get an empty outcome here — `run_node`
+            // treats that as fatal — so ask over the live connection for
+            // what the handshake would have carried.
+            let assigned = if self.shared.is_creator || !self.needs_assignment() {
+                VirtualAddrs::default()
+            } else {
+                let conn = self.shared.peer_conn(&remote).ok_or_else(|| {
+                    anyhow::anyhow!("live connection to the creator vanished")
+                })?;
+                request_addrs(&conn, desired).await?
+            };
             return Ok(DialOutcome {
                 remote: record,
-                assigned_addrs: VirtualAddrs::default(),
+                assigned_addrs: assigned,
             });
         }
         // The connect call consumes the address, but we must keep it: a drop

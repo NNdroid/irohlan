@@ -465,8 +465,9 @@ pub struct StatusReport {
 
 impl StatusReport {
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
-        Ok(())
+        // Atomic, like the ledger and metrics files: a reader (`irohlan
+        // status`) must never observe a half-written status.json.
+        write_atomic(path, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {

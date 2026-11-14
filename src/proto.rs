@@ -2,6 +2,7 @@
 //! messages and the framing used on mesh connections.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,25 @@ pub const ALPN: &[u8] = b"irohlan/v5";
 pub const MAX_STREAM_MSG_LEN: usize = 65_535;
 /// Upper bound for control messages on bi-directional streams.
 pub const MAX_CTRL_MSG_LEN: usize = 4_096;
+
+/// Starting value for a per-origin sequence number (LSA and flood bus).
+///
+/// Both sequence counters used to reset to zero on every process start, but
+/// receivers drop anything at or below the highest value they have already
+/// seen (`RoutingTable::apply` and the flood dedup ring): a restarted node's
+/// announcements were rejected as stale until its counter climbed back past
+/// the previous run's maximum — hours of bus silence on a quiet network.
+/// Seeding the counter with the current Unix time keeps it monotonic across
+/// restarts, with no persisted state. The low 20 bits leave room for ~1M
+/// messages per run before the counter carries into the time field, which
+/// keeps the value strictly increasing even then.
+pub fn seq_base() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        << 20
+}
 
 /// Tag byte prefixing every datagram and uni-directional stream payload.
 pub mod tag {
@@ -333,6 +353,19 @@ pub fn classify_frame(frame: &[u8]) -> Option<FrameClass> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_base_seeds_from_unix_time() {
+        assert_eq!(
+            seq_base() & ((1 << 20) - 1),
+            0,
+            "the counter bits start at zero"
+        );
+        assert!(
+            seq_base() >> 20 > 1_700_000_000,
+            "the seed dominates any run-local counter that started at zero"
+        );
+    }
 
     fn arp_request_frame() -> Vec<u8> {
         let mut f = vec![0xffu8; 6];
